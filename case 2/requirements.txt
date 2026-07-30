@@ -1,0 +1,15 @@
+# Case 2 - Reality Gap Modeling & RL Motion Optimization.
+# Analysis + modeling stack.
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
+scikit-learn>=1.3          # linear-regression baseline (and models to beat it)
+scipy>=1.10                # optional: Butterworth filter for the jerk metric
+
+# RL stack (Gold tier onward).
+gymnasium>=0.29
+stable-baselines3>=2.2
+
+# No robot driver: record.py talks to the robot over raw TCP sockets with the
+# Python standard library only (same approach as case 1/ur_client.py). Nothing
+# to compile, no ur_rtde.

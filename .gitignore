@@ -1,0 +1,32 @@
+# ── OS / editor cruft ───────────────────────────────────────────────────────
+.DS_Store
+**/.DS_Store
+Thumbs.db
+*~
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ── Secrets / scratch (root 'tmp' holds an API key — never commit) ────────────
+tmp
+.env
+*.env
+*.key
+
+# ── Agent / tooling config — not part of the student repo ─────────────────────
+ai/
+.claude/
+**/.claude/
+
+# ── docs/: ship the built .pptx + tiers doc, not the builder or its assets ────
+docs/build_deck.py
+docs/assets/
+docs/~$*.pptx
+docs/~$*.docx
+docs/*.tmp

@@ -1,0 +1,5 @@
+# Case 1, MCP server for robot tools.
+fastmcp>=2.0        # the MCP server framework (@mcp.tool decorators, stdio)
+# No robot driver to install: ur_client.py talks to the robot over plain TCP
+# sockets (primary interface for motion, RTDE for state) using only the Python
+# standard library. Nothing here needs a C++ toolchain.

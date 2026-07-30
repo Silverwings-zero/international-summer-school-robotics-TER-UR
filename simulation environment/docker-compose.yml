@@ -1,0 +1,67 @@
+# PolyScope X simulator (URSim) for the ESSRE 2026 cases.
+#
+# This is the robot for all three cases. PolyScope X is the software UR is moving
+# its whole fleet onto, so we develop against it rather than the classic e-Series
+# sim. The RTDE + primary interface ports are EXPOSED so the Case 1 MCP server
+# (ur_rtde) can read state and command motion from the host.
+#
+# The image runs NATIVELY on arm64 (Apple silicon) and amd64 -- no qemu.
+# `:latest` is a moving tag; pin a digest for a frozen classroom image if needed.
+#
+# Ports:
+#   80     PolyScope X web UI            -> http://localhost  (drive/enable robot)
+#   29999  Dashboard server              -> power on, brake release, load program
+#   30001  primary interface            -> ur_rtde uploads its control script here
+#   30002  secondary interface
+#   30004  RTDE                          -> ur_rtde reads state / streams commands
+#
+# privileged + dockervol:/var/lib/docker: the container runs an INNER docker
+# daemon (docker-in-docker) to launch the controller's URCap containers; that is
+# why it must be privileged and why /var/lib/docker is a named volume.
+#
+# Bring up:   docker compose up -d
+# Logs:       docker compose logs -f runtime
+# Tear down:  docker compose down          (add -v to also wipe robot state)
+
+services:
+  runtime:
+    image: universalrobots/ursim_polyscopex:latest
+    container_name: essre-ursim-psx
+    environment:
+      # Use the INTERNAL controller type (UR10), not the consumer name (UR10e).
+      # setup.sh derives ROBOT_TYPE_CONTROLLER from this, so do NOT set
+      # ROBOT_TYPE_CONTROLLER here -- passing "UR10E" to the controller makes it
+      # reject the type ("invalid choice: UR10E") and never boot. Valid values:
+      # UR3 UR5 UR7e UR10 UR12e UR15 UR16 UR18 UR20 UR30 UR8LONG (+ g variants).
+      - ROBOT_TYPE=${ROBOT_TYPE:-UR10}
+      - HOST_ARCH=${HOST_ARCH:-arm64}
+      - ROS2_NAMESPACE=${ROS2_NAMESPACE:-UR8888}
+      - DEVMODE=${DEVMODE:-true}
+    privileged: true
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PORT:-80}:80"
+      - "29999:29999"
+      - "30001:30001"
+      - "30002:30002"
+      - "30004:30004"
+    volumes:
+      - installed-urcaps:/var/urcaps
+      - ur-snippets:/etc/nginx/ur-snippets
+      - dockervol:/var/lib/docker
+      - applications:/ur/bin/backend/applications
+      - safety:/ur/etc/backend/safety
+    network_mode: bridge
+
+volumes:
+  installed-urcaps:
+    name: essre-ursim-psx-urcaps
+  ur-snippets:
+    name: essre-ursim-psx-ur-snippets
+  applications:
+    name: essre-ursim-psx-applications
+  dockervol:
+    name: essre-ursim-psx-docker-volume
+  safety:
+    name: essre-ursim-psx-safety-volume

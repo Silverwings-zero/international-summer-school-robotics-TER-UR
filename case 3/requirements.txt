@@ -1,0 +1,4 @@
+# Case 3, autonomous robot programming agent.
+mcp>=1.2            # official Model Context Protocol SDK (stdio client)
+openai>=1.30        # OpenAI-compatible chat client. Free backends: z-ai/glm-5.2
+                    # via NVIDIA NIM, Z.AI, Modal. Set AGENT_BASE_URL / AGENT_API_KEY.
