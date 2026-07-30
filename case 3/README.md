@@ -1,4 +1,4 @@
-# Case 3: Autonomous Robot Programming Agent
+# Case 3: Autonomous Agent
 
 Build an LLM agent that programs a UR10 for you. You give it a goal in plain
 language; it runs a loop, reason, act, observe, calling robot tools until the
@@ -117,8 +117,8 @@ plus how success is judged (the evaluator that goes in `evaluator.py`).
 | Trace a triangle (Silver) | `"trace a 15 cm triangle at z = 0.30 m"` | same idea, three waypoints |
 | Pick and place (Diamond) | `"pick up block_A and drop it in the bin"` | block_A ends at the bin, gripper released |
 
-Example waypoints for the square (TCP XYZ in metres) — the list you build a
-`PathTraced` evaluator from and pass in from `run.py`:
+Example waypoints for the square (TCP XYZ in metres). This is the list you build
+a `PathTraced` evaluator from and pass in from `run.py`:
 
 ```python
 square = [
@@ -142,7 +142,7 @@ world = {
 
 After each action the agent updates this record (position, held / released) and
 appends a one-line summary to the feedback, so it plans over named objects rather
-than raw joint numbers. Coordinates are illustrative — set them to reachable
+than raw joint numbers. Coordinates are illustrative, set them to reachable
 poses for your cell.
 
 ## Tiers

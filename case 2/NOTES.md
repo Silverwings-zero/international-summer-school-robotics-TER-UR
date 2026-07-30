@@ -1,4 +1,4 @@
-# Case 2 — working notes
+# Case 2: working notes
 
 ## Robot dynamics & sim-to-real (from UR "AI for developers" deck 2026-03, slide 26)
 Diagram: `reference/ur_dynamics.png`. Slide title: "Dynamic Access for Advanced
@@ -16,11 +16,11 @@ Rigid-body equation of motion:
 | G(q)    | Gravity (compensation) |
 | τ       | Torque command |
 
-**URScript exposes these dynamics functions** — mass matrix, Coriolis/centrifugal
+**URScript exposes these dynamics functions:** mass matrix, Coriolis/centrifugal
 terms, Jacobians, and their time derivatives.
 
 **Why it matters for Case 2:** these functions enable model-based control and let
-you *align the simulator with the real robot's physics* — directly attacking the
+you *align the simulator with the real robot's physics*, directly attacking the
 reality gap the case is about. Framing to use: the gap model the students learn is
 approximating what these dynamics terms (plus unmodeled friction/backlash/thermal
 effects) do on the real UR10. RL then optimizes speed-vs-vibration on top.

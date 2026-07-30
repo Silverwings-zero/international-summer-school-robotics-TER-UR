@@ -1,4 +1,4 @@
-# Simulation Environment — PolyScope X (URSim)
+# Simulation Environment: PolyScope X (URSim)
 
 The robot for all three ESSRE cases is the **PolyScope X simulator** (URSim). It
 runs the same PolyScope X software UR is rolling its whole fleet onto, so you
@@ -45,13 +45,13 @@ code can read state and command motion over plain TCP sockets:
 | Port  | Interface            | Used for                                   |
 |-------|----------------------|--------------------------------------------|
 | 80    | PolyScope X web UI   | drive / enable the robot, watch it move    |
-| 30001 | Primary interface    | motion — upload a URScript `movej`         |
+| 30001 | Primary interface    | motion, upload a URScript `movej`          |
 | 30002 | Secondary interface  | (available)                                |
-| 30004 | RTDE                 | state — read joint angles / TCP pose       |
+| 30004 | RTDE                 | state, read joint angles / TCP pose        |
 | 29999 | Dashboard            | (PolyScope X does not use the classic protocol) |
 
 Case 1's `ur_client.py` talks to 30001 (motion) and 30004 (state) with the
-Python standard library only — nothing to compile.
+Python standard library only, nothing to compile.
 
 ## Robot type
 `ROBOT_TYPE` defaults to `UR10` (see `docker-compose.yml`). Override at bring-up
@@ -60,11 +60,11 @@ for a different arm, using the **internal** controller name, e.g.:
 ROBOT_TYPE=UR20 docker compose up -d
 ```
 Valid values: `UR3 UR5 UR7e UR10 UR12e UR15 UR16 UR18 UR20 UR30 UR8LONG` (and the
-`g` variants). Note it's `UR10`, not `UR10e` — the consumer suffix is not a valid
+`g` variants). Note it's `UR10`, not `UR10e`. The consumer suffix is not a valid
 controller type here. If you change the type, `docker compose down -v` first so
 the old robot's state is wiped.
 
 ## Notes
 - `:latest` is a moving image tag. For a frozen classroom image, pin a digest.
 - The container is `privileged` and runs an inner Docker daemon (the controller
-  launches its own service containers) — that's expected for URSim.
+  launches its own service containers), that's expected for URSim.
