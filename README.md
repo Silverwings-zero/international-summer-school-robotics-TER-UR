@@ -59,7 +59,7 @@ Two shared pieces set up once, then pick a case.
 | Path | What |
 |------|------|
 | `case 1/` | MCP server: `server.py` (worked tool), `ur_client.py` (robot seam), `test_server.py` |
-| `case 2/` | Reality-gap RL: `dataset.py` / `record.py`, `gap_model.py`, `gap_env.py`, `metrics.py` |
+| `case 2/` | Reality-gap RL: `train_distillation_model.py` (DistillModel), `dynamics.py` (Dynamics), `train_rla.py` (RL env), `metrics.py`, `run.py` |
 | `case 3/` | Autonomous agent: `agent.py` (the loop), `prompts.py`, `serializer.py`, `evaluator.py` |
 | `llm-client/` | The free LLM client setup (self-hosted and cloud-hosted guides) |
 | `simulation environment/` | The PolyScope X (URSim) simulator and docker-compose |
@@ -85,5 +85,11 @@ work is provided as-is, without warranty.
 
 ## Contact
 
-Emil Stubbe Kolvig-Raun, Sr. AI Engineering (PhD), Teradyne Robotics / Universal
+Emil Stubbe Kolvig-Raun, Teradyne Robotics / Universal
 Robots. Contact: eskr@universal-robots.com
+
+
+
+
+
+Copyright 2026 Universal Robots A/S

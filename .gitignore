@@ -24,8 +24,9 @@ ai/
 .claude/
 **/.claude/
 
-# ── docs/: ship the built .pptx + tiers doc, not the builder or its assets ────
+# ── docs/: ship the built .pptx + tiers doc, not the builders or its assets ───
 docs/build_deck.py
+docs/build_tiers.py
 docs/assets/
 docs/~$*.pptx
 docs/~$*.docx
