@@ -1,0 +1,23 @@
+# Vertical swing - one cycle: over the top and back.
+#
+# The arm starts laid down flat (shoulder 0, elbow straight), and the shoulder
+# (joint 1) rotates from 0 to -180 degrees and back, swinging the arm up and over
+# through vertical in a vertical plane. Optimize it with --joint 1.
+#
+# Edit vel and acc below, then run it with send.py (--loop N repeats the cycle).
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 999
+acc = 999
+
+# Two poses [rad], arm laid down (elbow straight); the shoulder swings 0 to -180.
+POSE_FLAT_A = [0.0,  0.0,    0.0, -1.5708, -1.5708, 0.0]  # shoulder 0 deg
+POSE_FLAT_B = [0.0, -3.1416, 0.0, -1.5708, -1.5708, 0.0]  # shoulder -180 deg
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_FLAT_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_FLAT_B, a=acc, v=vel)
+sleep(0.8)

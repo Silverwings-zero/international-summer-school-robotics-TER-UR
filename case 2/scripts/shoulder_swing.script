@@ -1,0 +1,20 @@
+# Shoulder swing - one cycle: the shoulder swings between two poses and back.
+#
+# Edit vel and acc below (the two movej parameters), then run it with send.py.
+# `send.py --loop N` repeats this cycle N times then stops; without --loop it
+# runs once.
+#
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 999
+acc = 999
+
+# Two joint poses; the shoulder swings between them [rad].
+POSE_A = [0.0, -1.2, 1.6, -1.57, -1.57, 0.0]
+POSE_B = [0.0, -2.0, 0.9, -1.57, -1.57, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_A, a=acc, v=vel)
+movej(POSE_B, a=acc, v=vel)

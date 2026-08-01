@@ -1,129 +1,60 @@
-"""Vibration metrics for the reality-gap case.
+"""Score a recording's rows into one per-row value the optimizer minimizes.
 
-The reality gap shows up at the *end* of a move: the real robot overshoots the
-commanded target and rings down before it settles. These functions turn that
-wobble into single numbers you can plot (Bronze) and later optimize (Gold).
+``EvaluationMetric`` is the interface:
 
-Two metrics are provided (both defined over the *settling window*, the stretch
-after the command has reached its final value):
+    needs()      -> per-joint channel bases this metric reads
+    per_row(df)  -> (n,) score, one value per row
 
-    peak overshoot : max | actual(t) - target |   -> worst single spike
-    rms error      : sqrt(mean((actual(t)-target)^2)) -> sustained wobble
-
-``jerk_rms`` is optional reference code (needs SciPy) for a smoothness term.
-
-All functions take plain 1-D NumPy arrays for one joint. Use ``run_metrics`` to
-get the per-joint numbers for a whole recorded run at once.
+The default ``CurrentGapMetric`` is the current-tracking gap. A subclass can read
+other channels (position error, jerk, a mix); each must be a channel the recording
+carries or the distill model predicts.
 """
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
+
 import numpy as np
 
+from utils import get_block, joint_cols
 
-# A move "arrives" when the commanded target stops changing (within EPS, in
-# radians). Everything after that is the settling window we score.
-SETTLE_EPS = 1e-4
+SCORE_COL = "score"
 
 
-def settling_mask(target: np.ndarray, eps: float = SETTLE_EPS) -> np.ndarray:
-    """Boolean mask selecting the settling window of one joint.
+class EvaluationMetric(ABC):
+    """Per-row score to minimize. Implement ``needs`` and ``per_row``."""
 
-    The window starts at the first sample from which ``target`` stays within
-    ``eps`` of its final commanded value, and runs to the end of the recording.
+    @abstractmethod
+    def needs(self) -> list[str]:
+        """Per-joint channel bases this metric reads, e.g. ``["target_current",
+        "actual_current"]``. Each must be a recording channel or one the distill
+        model predicts, or ``add_score`` raises.
+        """
 
-    Args:
-        target: Commanded joint angle over time, shape ``(T,)`` (radians).
-        eps: Tolerance (radians) for "target has reached its final value".
+    @abstractmethod
+    def per_row(self, df) -> np.ndarray:
+        """Score for every row of ``df``, shape ``(n,)``."""
 
-    Returns:
-        Boolean array, shape ``(T,)``; ``True`` inside the settling window.
+
+class CurrentGapMetric(EvaluationMetric):
+    """Current-tracking gap: ``|actual_current - target_current|`` summed over joints."""
+
+    def needs(self) -> list[str]:
+        return ["target_current", "actual_current"]
+
+    def per_row(self, df) -> np.ndarray:
+        gap = np.abs(get_block(df, "actual_current") - get_block(df, "target_current"))
+        return gap.sum(axis=1)
+
+
+def add_score(df, metric: EvaluationMetric):
+    """Return ``df`` with a ``score`` column from ``metric``.
+
+    Checks the channels the metric needs are present, so a missing column raises
+    here rather than later.
     """
-    target = np.asarray(target, dtype=float)
-    final = target[-1]
-    moving = np.abs(target - final) > eps
-    moving_idx = np.where(moving)[0]
-    arrival = 0 if moving_idx.size == 0 else int(moving_idx[-1]) + 1
-    mask = np.zeros_like(target, dtype=bool)
-    mask[min(arrival, target.size - 1):] = True
-    return mask
-
-
-def peak_overshoot(actual: np.ndarray, target: np.ndarray,
-                   mask: np.ndarray | None = None) -> float:
-    """Largest deviation from target within the settling window (radians)."""
-    actual = np.asarray(actual, dtype=float)
-    target = np.asarray(target, dtype=float)
-    if mask is None:
-        mask = settling_mask(target)
-    if not mask.any():
-        return 0.0
-    return float(np.max(np.abs(actual[mask] - target[mask])))
-
-
-def rms_error(actual: np.ndarray, target: np.ndarray,
-              mask: np.ndarray | None = None) -> float:
-    """Root-mean-square position error within the settling window (radians)."""
-    actual = np.asarray(actual, dtype=float)
-    target = np.asarray(target, dtype=float)
-    if mask is None:
-        mask = settling_mask(target)
-    if not mask.any():
-        return 0.0
-    err = actual[mask] - target[mask]
-    return float(np.sqrt(np.mean(err ** 2)))
-
-
-def jerk_rms(actual: np.ndarray, dt: float, *, cutoff_hz: float = 10.0,
-             order: int = 2) -> float:
-    """RMS jerk (rad/s^3) of a joint trajectory, optional smoothness metric.
-
-    Jerk is the third time-derivative of position and is noisy, so the signal is
-    low-pass filtered (Butterworth) before differencing. Requires SciPy; if it is
-    not installed, raises ``ImportError`` with a hint (the metric is optional).
-
-    Args:
-        actual: Measured joint angle over time, shape ``(T,)`` (radians).
-        dt: Sample period in seconds.
-        cutoff_hz: Low-pass cutoff for the Butterworth filter.
-        order: Butterworth filter order.
-    """
-    try:
-        from scipy.signal import butter, filtfilt
-    except ImportError as exc:  # optional dependency
-        raise ImportError(
-            "jerk_rms needs SciPy (pip install scipy). The jerk metric is "
-            "optional; peak_overshoot and rms_error do not need it."
-        ) from exc
-    actual = np.asarray(actual, dtype=float)
-    fs = 1.0 / dt
-    b, a = butter(order, cutoff_hz / (0.5 * fs), btype="low")
-    smooth = filtfilt(b, a, actual)
-    jerk = np.gradient(np.gradient(np.gradient(smooth, dt), dt), dt)
-    return float(np.sqrt(np.mean(jerk ** 2)))
-
-
-def run_metrics(target_q: np.ndarray, actual_q: np.ndarray) -> dict:
-    """Per-joint peak overshoot and RMS error for a whole run.
-
-    Args:
-        target_q: Commanded joint angles, shape ``(T, 6)`` (radians).
-        actual_q: Measured joint angles, shape ``(T, 6)`` (radians).
-
-    Returns:
-        Dict with ``peak`` and ``rms`` lists (one value per joint) and their
-        max/mean summaries, all in radians.
-    """
-    target_q = np.asarray(target_q, dtype=float)
-    actual_q = np.asarray(actual_q, dtype=float)
-    n_joints = target_q.shape[1]
-    peaks, rmss = [], []
-    for j in range(n_joints):
-        mask = settling_mask(target_q[:, j])
-        peaks.append(peak_overshoot(actual_q[:, j], target_q[:, j], mask))
-        rmss.append(rms_error(actual_q[:, j], target_q[:, j], mask))
-    return {
-        "peak": peaks,
-        "rms": rmss,
-        "peak_max": max(peaks),
-        "rms_mean": float(np.mean(rmss)),
-    }
+    missing = [c for base in metric.needs() for c in joint_cols(base) if c not in df]
+    if missing:
+        raise ValueError(f"metric needs columns not in the recording: {missing}")
+    df = df.copy()                          # defragment: recordings are very wide
+    df[SCORE_COL] = metric.per_row(df)
+    return df

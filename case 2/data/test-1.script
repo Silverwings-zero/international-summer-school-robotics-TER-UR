@@ -1,0 +1,37 @@
+global Point_2 = struct(p=p[-1.039048190750582, -0.8327379406866211, 0.24980303394871461, -0.0741796411319628, -1.6391233025335143, -0.9915148157996458], frame="base", q=[4.0364, -3.1289, 0.0543, 4.8235, -0.0219, -0.7677])
+global Point_1 = struct(p=p[0.5861259469564739, 1.1944759215782665, 0.27542119096259204, 3.3253213363654788, 0.2043427693073821, -2.4305270573672497], frame="base", q=[4.0368, -0.1162, 0.0791, 4.7188, -0.0182, -0.7677])
+$ 1 "ur-program"
+$ 2 "ur-modules"
+$ 3 "ur-functions"
+$ 4 "ur-before-start"
+$ 5 "ur-assignment"
+global vel = 100
+$ 6 "ur-assignment"
+global acc = 100
+$ 7 "ur-code"
+while (True):
+  $ 8 "ur-script"
+  write_output_float_register(1,vel)
+  $ 9 "ur-script"
+  write_output_float_register(2,acc)
+  $ 10 "ur-loop"
+  Loop = 0
+  while (Loop < 10):
+    $ 11 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_2.p, Point_2.frame, "base"), qnear=Point_2.q), a=acc, v=vel)
+    $ 12 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_1.p, Point_1.frame, "base"), qnear=Point_1.q), a=acc, v=vel)
+    Loop = Loop + 1
+  end
+  $ 13 "ur-assignment"
+  vel = vel -10
+  $ 14 "ur-assignment"
+  acc = acc -10
+  $ 15 "ur-if"
+  if (acc == 10 or vel == 10):
+    $ 16 "ur-halt"
+    halt
+  end
+end

@@ -1,0 +1,23 @@
+# Horizontal swing - one cycle: swing there and back.
+#
+# The arm lies down flat (shoulder and elbow at 0, so a straight bar out to the
+# side) and the base (joint 0) rotates it from 0 to -180 degrees and back, sweeping
+# a half turn horizontally. Analyze it with --joint 0.
+#
+# Edit vel and acc below, then run it with send.py (--loop N repeats the cycle).
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 999
+acc = 999
+
+# Two poses [rad], arm laid down flat (shoulder and elbow 0); the base swings.
+POSE_SIDE_A = [ 0.0,    0.0, 0.0, -1.5708, -1.5708, 0.0]  # base 0 deg
+POSE_SIDE_B = [-3.2, 0.0, 0.0, -1.5708, -1.5708, 0.0]  # base -180 deg
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(POSE_SIDE_A, a=acc, v=vel)
+sleep(0.8)
+movej(POSE_SIDE_B, a=acc, v=vel)
+sleep(0.8)

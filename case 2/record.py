@@ -1,25 +1,35 @@
-"""Record UR runs (target vs actual) to the dataset CSV schema.
+"""Passively record a UR's RTDE state to a CSV.
 
-Run this ON a real UR (or URSim, though there the gap is near zero) to build the
-dataset that ``dataset.py`` loads. It sweeps a set of point-to-point moves over a
-grid of speed / acceleration / payload values, and for each move logs the
-commanded (``target_q``) and measured (``actual_q``) joint angles at the RTDE
-rate into one CSV per run.
+Opens an RTDE stream to the controller and writes every sample to a CSV until
+Ctrl-C. It does not move the robot; it logs whatever drives the arm (a PolyScope
+program, a script sent separately).
 
-    python record.py --robot-ip 192.168.1.10 --out data
+    python record.py --robot-ip 10.54.5.147 --out run.csv
 
-One CSV = one run = one (move, speed, accel, payload) combination, columns
-exactly as documented in dataset.py. Keep this in sync with that schema.
+A running URScript can publish values with ``write_output_float_register(i,
+value)``. Name those registers on the command line and each becomes a CSV
+column. For a program doing ``write_output_float_register(1, vel)`` and
+``(2, acc)``:
 
-Robot interface: the Python standard library only, exactly like Case 1's
-``case 1/ur_client.py`` -- nothing to compile, no ``ur_rtde``. Two UR network
-interfaces are spoken directly over TCP sockets:
+    python record.py --robot-ip 10.54.5.147 --float-register 1 vel 2 acc
 
-  * Primary interface (30001) -- MOTION. Upload a tiny URScript ``movej``.
-  * RTDE (30004) -- STATE. Stream ``target_q`` + ``actual_q`` while the robot
-    moves and rings down, so the reality gap is captured.
+Rows are flushed as they arrive, so Ctrl-C or a dropped connection keeps the
+data recorded so far. The CSV is the schema ``analysis.Recording`` loads.
 
-It is NOT run during the exercise: the dataset is recorded once and shared.
+Channels per sample (joint vectors are 6 wide, base..wrist3):
+    positions   target_q  / actual_q                       (rad)
+    velocities  target_qd / actual_qd                      (rad/s)
+    accel       target_qdd (commanded)  +  actual_TCP_acceleration
+                RTDE has NO per-joint measured acceleration; only target_qdd.
+    currents    target_current / actual_current            (A)
+    torque      target_moment  / actual_current_as_torque  (Nm)
+    control     joint_control_output
+    TCP         target/actual pose + speed, actual force + acceleration
+    state       robot_mode, runtime_state, script_control_line
+    registers   whatever --float-register names
+
+Pure Python standard library, one TCP socket to the RTDE interface (30004).
+Field names and types are from the UR RTDE guide.
 """
 from __future__ import annotations
 
@@ -30,225 +40,209 @@ import socket
 import struct
 import time
 
-import numpy as np
+from utils import N_JOINTS, TIME_COL
 
-from dataset import (ACTUAL_Q_COLS, META_COLS, N_JOINTS, TARGET_Q_COLS,
-                     TIME_COL)
-
-# --- UR network interfaces (same as case 1/ur_client.py) ----------------- #
-PRIMARY_PORT = 30001   # motion: upload URScript here
-RTDE_PORT = 30004      # state: stream joint angles here
-
-ROBOT_MODE_RUNNING = 7  # powered on, brakes released, ready to move
+RTDE_PORT = 30004
 
 # RTDE protocol command bytes (see the UR RTDE guide).
 _RTDE_REQUEST_PROTOCOL_VERSION = 86  # 'V'
 _RTDE_SETUP_OUTPUTS = 79             # 'O'
 _RTDE_START = 83                     # 'S'
 _RTDE_DATA_PACKAGE = 85              # 'U'
-# We record the commanded setpoint AND the measured angle at each instant; their
-# difference over a move is the reality gap the whole case is about.
-_RTDE_OUTPUTS = "target_q,actual_q,robot_mode"
 
-# Home pose for the sweep (radians). More diverse moves make a better gap model.
-HOME = [0.0, -np.pi / 2, 0.0, -np.pi / 2, 0.0, 0.0]
-
-# Parameter sweep. Every combination is recorded for every move.
-SPEED_GRID = [0.5, 1.0, 1.75, 2.5]      # rad/s
-ACCEL_GRID = [1.0, 3.0, 6.0]            # rad/s^2
-PAYLOAD_GRID = [0.0]                    # kg; set the real TCP payload(s) here
-
-LOG_HZ = 125.0                          # RTDE sample rate
-SETTLE_S = 0.6                          # extra logging after the move completes
-ARRIVE_TOL = 1e-3                       # rad; target_q within this of goal == done
-
-
-def _build_moves() -> dict:
-    """Named goal poses: each is HOME with one joint rotated 90 degrees."""
-    moves = {}
-    for j in range(N_JOINTS):
-        goal = list(HOME)
-        goal[j] += np.pi / 2
-        moves[f"j{j}_90"] = goal
-    return moves
+# Fixed RTDE recipe: (field, kind), in wire order. Kinds and their byte sizes:
+#   d = DOUBLE (8)   v6 = VECTOR6D, 6 doubles (48)   i32 = INT32 (4)   u32 = UINT32 (4)
+RECIPE = [
+    ("timestamp", "d"),
+    ("target_q", "v6"), ("target_qd", "v6"), ("target_qdd", "v6"),
+    ("target_current", "v6"), ("target_moment", "v6"),
+    ("actual_q", "v6"), ("actual_qd", "v6"), ("actual_current", "v6"),
+    ("actual_current_as_torque", "v6"), ("joint_control_output", "v6"),
+    ("target_TCP_pose", "v6"), ("target_TCP_speed", "v6"),
+    ("actual_TCP_pose", "v6"), ("actual_TCP_speed", "v6"),
+    ("actual_TCP_force", "v6"), ("actual_TCP_acceleration", "v6"),
+    ("robot_mode", "i32"), ("runtime_state", "u32"), ("script_control_line", "u32"),
+]
+_KIND_SIZE = {"d": 8, "v6": 48, "i32": 4, "u32": 4}
 
 
-# --- RTDE framing (identical to case 1/ur_client.py) --------------------- #
-def _rtde_send(s: socket.socket, cmd: int, payload: bytes = b"") -> None:
+def build_recipe(registers):
+    """Fixed recipe plus one DOUBLE per requested output float register.
+
+    ``registers`` is a list of ``(index, column_name)``. Returns entries of
+    ``(rtde_field, kind, csv_label)``; ``csv_label`` is None for the fixed fields.
+    """
+    recipe = [(name, kind, None) for name, kind in RECIPE]
+    for idx, name in registers:
+        recipe.append((f"output_double_register_{idx}", "d", name))
+    return recipe
+
+
+def csv_columns(recipe):
+    """Flat header: t, then each field (v6 expands to label0..label5)."""
+    cols = [TIME_COL]
+    for name, kind, label in recipe:
+        col = label or name
+        cols += [f"{col}{i}" for i in range(N_JOINTS)] if kind == "v6" else [col]
+    return cols
+
+
+def _rtde_send(s, cmd, payload=b""):
     s.sendall(struct.pack(">HB", 3 + len(payload), cmd) + payload)
 
 
-def _rtde_recv(s: socket.socket) -> tuple[int, bytes]:
-    hdr = b""
-    while len(hdr) < 3:
-        hdr += s.recv(3 - len(hdr))
-    size, cmd = struct.unpack(">HB", hdr)
-    body = b""
-    while len(body) < size - 3:
-        chunk = s.recv(size - 3 - len(body))
+def _recv_exact(s, n):
+    """Read exactly ``n`` bytes; raise if the controller closes the stream."""
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
         if not chunk:
-            break
-        body += chunk
-    return cmd, body
-
-
-class URRecorder:
-    """Minimal pure-socket UR client for recording (mirrors ur_client.py).
-
-    Streaming is needed here (Case 1's one-shot ``get_state`` is not enough): to
-    see the gap we must sample ``target_q`` and ``actual_q`` continuously while
-    the robot is in motion, so we hold one RTDE connection open per run.
-    """
-
-    def __init__(self, host: str):
-        self.host = host
-
-    def _open_stream(self) -> socket.socket:
-        """Open an RTDE connection and start it streaming our output recipe."""
-        s = socket.create_connection((self.host, RTDE_PORT), timeout=5)
-        _rtde_send(s, _RTDE_REQUEST_PROTOCOL_VERSION, struct.pack(">H", 2))
-        _rtde_recv(s)  # version-accepted reply
-        _rtde_send(s, _RTDE_SETUP_OUTPUTS,
-                   struct.pack(">d", LOG_HZ) + _RTDE_OUTPUTS.encode())
-        _rtde_recv(s)  # recipe + variable types
-        _rtde_send(s, _RTDE_START)
-        _rtde_recv(s)  # start-accepted reply
-        return s
-
-    @staticmethod
-    def _read_sample(s: socket.socket) -> tuple[list, list, int]:
-        """Read the next RTDE data package -> (target_q, actual_q, robot_mode)."""
-        cmd, body = _rtde_recv(s)
-        while cmd != _RTDE_DATA_PACKAGE:  # skip any non-data control replies
-            cmd, body = _rtde_recv(s)
-        off = 1  # first byte is the recipe id
-        target = list(struct.unpack(">6d", body[off:off + 48])); off += 48
-        actual = list(struct.unpack(">6d", body[off:off + 48])); off += 48
-        mode = struct.unpack(">i", body[off:off + 4])[0]
-        return target, actual, mode
-
-    def snapshot(self) -> tuple[list, list, int]:
-        """One (target_q, actual_q, robot_mode) reading; opens/closes a stream."""
-        with self._open_stream() as s:
-            return self._read_sample(s)
-
-    def send_move(self, goal, speed: float, accel: float) -> None:
-        """Upload a non-blocking URScript ``movej`` to the primary interface."""
-        joints = ", ".join(f"{v:.6f}" for v in goal)
-        script = (
-            "def move_to():\n"
-            f"  movej([{joints}], a={accel:.4f}, v={speed:.4f})\n"
-            "end\n"
-        )
-        with socket.create_connection((self.host, PRIMARY_PORT), timeout=5) as s:
-            s.sendall(script.encode())
-
-    def move_blocking(self, goal, speed: float, accel: float,
-                      *, tol_rad: float = 0.01, timeout_s: float = 20.0) -> None:
-        """Move to ``goal`` and wait until the robot arrives (used to reset home)."""
-        self.send_move(goal, speed, accel)
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            time.sleep(0.3)
-            _, actual, _ = self.snapshot()
-            if max(abs(a - b) for a, b in zip(actual, goal)) <= tol_rad:
-                return
-        raise TimeoutError(f"Robot did not reach home within {timeout_s:.0f}s.")
-
-    def require_running(self) -> None:
-        """Fail fast with a readable reason if the robot is not powered on."""
-        try:
-            _, _, mode = self.snapshot()
-        except OSError as exc:
             raise ConnectionError(
-                f"Cannot reach the robot at {self.host}:{RTDE_PORT} ({exc}). Is "
-                "the simulator up (../simulation environment: docker compose up "
-                "-d) or the robot on the network?"
-            ) from exc
-        if mode != ROBOT_MODE_RUNNING:
-            raise RuntimeError(
-                f"Robot is not powered on (mode {mode}, need {ROBOT_MODE_RUNNING}"
-                "=RUNNING). Power it on + release brakes first (URSim: open "
-                "http://localhost)."
+                "RTDE stream closed by the controller (it drops clients that "
+                "cannot keep up, try a lower --hz)."
             )
+        buf += chunk
+    return buf
 
 
-def record_run(robot: URRecorder, *, goal, speed, accel):
-    """Execute one move and log it. Returns (times, target_q, actual_q).
+def _rtde_recv(s):
+    size, cmd = struct.unpack(">HB", _recv_exact(s, 3))
+    return cmd, _recv_exact(s, size - 3)
 
-    Streams RTDE while the non-blocking ``movej`` runs, then keeps sampling for
-    ``SETTLE_S`` after the commanded setpoint reaches the goal, to capture the
-    end-of-move vibration (the ring-down) that defines the gap.
+
+def open_stream(host, hz, recipe):
+    """Connect, subscribe to ``recipe``, and start streaming."""
+    fields = ",".join(name for name, _, _ in recipe)
+    s = socket.create_connection((host, RTDE_PORT), timeout=5)
+    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    _rtde_send(s, _RTDE_REQUEST_PROTOCOL_VERSION, struct.pack(">H", 2))
+    _rtde_recv(s)  # version reply
+    _rtde_send(s, _RTDE_SETUP_OUTPUTS, struct.pack(">d", hz) + fields.encode())
+    _, reply = _rtde_recv(s)  # recipe id byte + variable types CSV
+    types = reply[1:].decode(errors="replace")
+    bad = [f for f, t in zip(fields.split(","), types.split(","))
+           if t.strip() in ("NOT_FOUND", "IN_USE")]
+    if bad:
+        s.close()
+        raise RuntimeError(f"RTDE rejected fields {bad} (reply: {types!r}).")
+    _rtde_send(s, _RTDE_START)
+    _rtde_recv(s)  # start reply
+    return s
+
+
+def read_sample(s, recipe):
+    """Read the next data package into ``{field: value}``."""
+    cmd, body = _rtde_recv(s)
+    while cmd != _RTDE_DATA_PACKAGE:  # skip control replies
+        cmd, body = _rtde_recv(s)
+    off = 1  # first byte is the recipe id
+    out = {}
+    for name, kind, _ in recipe:
+        chunk = body[off:off + _KIND_SIZE[kind]]
+        if kind == "v6":
+            out[name] = struct.unpack(">6d", chunk)
+        elif kind == "d":
+            out[name] = struct.unpack(">d", chunk)[0]
+        elif kind == "i32":
+            out[name] = struct.unpack(">i", chunk)[0]
+        else:  # u32
+            out[name] = struct.unpack(">I", chunk)[0]
+        off += _KIND_SIZE[kind]
+    return out
+
+
+def sample_row(t, smp, recipe):
+    """Flatten one sample into a CSV row matching :func:`csv_columns`."""
+    row = [f"{t:.6f}"]
+    for name, kind, _ in recipe:
+        v = smp[name]
+        if kind == "v6":
+            row += [f"{x:.6f}" for x in v]
+        elif kind == "d":
+            row.append(f"{v:.6f}")
+        else:
+            row.append(str(v))
+    return row
+
+
+def parse_registers(tokens):
+    """``['1','vel','2','acc']`` -> ``[(1,'vel'),(2,'acc')]`` (commas optional)."""
+    toks = [t.strip(",") for t in (tokens or []) if t.strip(",")]
+    if len(toks) % 2:
+        raise SystemExit("--float-register needs index name pairs, e.g. 1 vel 2 acc")
+    regs = []
+    for i in range(0, len(toks), 2):
+        idx = int(toks[i])
+        if not 0 <= idx <= 47:
+            raise SystemExit(f"float register index {idx} out of range 0..47")
+        regs.append((idx, toks[i + 1]))
+    return regs
+
+
+def record_stream(stream, out, recipe, stop_check=None):
+    """Read samples from an open RTDE ``stream`` and write them to CSV ``out``.
+
+    The core record loop, shared by ``record.py`` (log until Ctrl-C) and
+    ``send.py`` (log until the sent program finishes). ``stop_check(smp, t)`` is
+    called per sample with the sample dict and elapsed seconds; return a reason
+    string to stop, or ``None`` to keep going. When ``None`` is passed the loop
+    only stops on Ctrl-C or a dropped stream.
+
+    Returns ``(n_samples, reason)``.
     """
-    goal_arr = np.asarray(goal, dtype=float)
-    stream = robot._open_stream()
+    n, stop = 0, None
     try:
-        robot.send_move(goal, speed, accel)
-        t0 = time.monotonic()
-        times, tgt, act = [], [], []
-        settle_until = None
-        while True:
-            target, actual, _ = robot._read_sample(stream)
-            now = time.monotonic()
-            times.append(now - t0)
-            tgt.append(target)
-            act.append(actual)
-            arrived = np.max(np.abs(np.asarray(target) - goal_arr)) < ARRIVE_TOL
-            if arrived and settle_until is None:
-                settle_until = now + SETTLE_S
-            if settle_until is not None and now >= settle_until:
-                break
-    finally:
-        stream.close()
-    return np.array(times), np.array(tgt), np.array(act)
-
-
-def write_csv(path, times, target_q, actual_q, *, speed, accel, blend, payload):
-    """Write one run to CSV in the dataset.py schema."""
-    header = [TIME_COL, *TARGET_Q_COLS, *ACTUAL_Q_COLS, *META_COLS]
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(header)
-        for i in range(len(times)):
-            w.writerow([
-                f"{times[i]:.6f}",
-                *[f"{v:.6f}" for v in target_q[i]],
-                *[f"{v:.6f}" for v in actual_q[i]],
-                speed, accel, blend, payload,
-            ])
+        with open(out, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(csv_columns(recipe))
+            t0 = time.monotonic()
+            last_io = t0
+            while True:
+                smp = read_sample(stream, recipe)
+                now = time.monotonic()
+                w.writerow(sample_row(now - t0, smp, recipe))
+                n += 1
+                if stop_check is not None:
+                    stop = stop_check(smp, now - t0)
+                    if stop:
+                        break
+                # Flush + progress a few times a second, NOT per sample: flushing
+                # at the full rate starves the reader and the controller drops us.
+                if now - last_io >= 0.25:
+                    fh.flush()
+                    print(f"\r  {n} samples  {now - t0:6.1f}s", end="", flush=True)
+                    last_io = now
+    except KeyboardInterrupt:
+        stop = "Ctrl-C"
+    except ConnectionError as exc:
+        stop = str(exc)
+    return n, stop
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description="Passively log UR RTDE state to a CSV.")
     ap.add_argument("--robot-ip", default=os.environ.get("UR_HOST", "127.0.0.1"),
                     help="UR controller IP (default: $UR_HOST or 127.0.0.1)")
-    ap.add_argument("--out", default="data", help="output folder for run CSVs")
-    ap.add_argument("--speed-home", type=float, default=0.8,
-                    help="speed for returning to home between runs (rad/s)")
+    ap.add_argument("--out", default="run.csv", help="output CSV path")
+    ap.add_argument("--hz", type=float, default=125.0, help="sample rate (default 125)")
+    ap.add_argument("--float-register", nargs="+", metavar="IDX NAME",
+                    help="log output float registers, e.g. 1 vel 2 acc")
     args = ap.parse_args()
 
-    robot = URRecorder(args.robot_ip)
-    robot.require_running()  # clear error if unreachable or not powered on
+    recipe = build_recipe(parse_registers(args.float_register))
 
-    os.makedirs(args.out, exist_ok=True)
-    moves = _build_moves()
+    out = args.out
+    if os.path.isdir(out):  # a folder was given: write a default file inside it
+        out = os.path.join(out, "run.csv")
+    os.makedirs(os.path.dirname(os.path.abspath(out)), exist_ok=True)
+
+    stream = open_stream(args.robot_ip, args.hz, recipe)
+    print(f"recording {args.robot_ip} -> {out}  (Ctrl-C to stop)")
     try:
-        for payload in PAYLOAD_GRID:
-            # NOTE: payload is logged as a run parameter; set the robot's TCP
-            # payload in PolyScope / your installation to match before recording.
-            for name, goal in moves.items():
-                for speed in SPEED_GRID:
-                    for accel in ACCEL_GRID:
-                        robot.move_blocking(HOME, args.speed_home, 2.0)  # reset
-                        times, tgt, act = record_run(
-                            robot, goal=goal, speed=speed, accel=accel)
-                        run_id = f"{name}_v{speed}_a{accel}_p{payload}"
-                        path = os.path.join(args.out, f"{run_id}.csv")
-                        write_csv(path, times, tgt, act, speed=speed,
-                                  accel=accel, blend=0.0, payload=payload)
-                        print(f"wrote {path}  ({len(times)} samples)")
+        n, stop = record_stream(stream, out, recipe)
     finally:
-        robot.move_blocking(HOME, args.speed_home, 2.0)
+        stream.close()
+    print(f"\nwrote {n} samples to {out}" + (f"  ({stop})" if stop else ""))
 
 
 if __name__ == "__main__":

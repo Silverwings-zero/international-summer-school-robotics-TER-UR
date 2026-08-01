@@ -1,0 +1,29 @@
+# Triangle - one cycle: trace a triangle between three poses.
+#
+# Three joint poses [rad]; the arm movej's between them, so base (joint 0),
+# shoulder (joint 1) and elbow (joint 2) all move. A movej between two poses is a
+# straight line in joint space, so its geometry is fixed and vel/acc only set the
+# speed along it. Analyze a joint with --joint.
+#
+# Edit vel and acc below, then run it with send.py (--loop N repeats the cycle).
+# Plain assignments (no `global`): send.py wraps this in a repeat loop, and
+# URScript does not allow a `global` declaration inside a loop.
+
+vel = 999
+acc = 999
+
+# Three corners of the triangle [rad]; the cycle is C1 -> C2 -> C3 -> C1.
+CORNER_1 = [ 0.0, -1.4, 1.4, -1.57, -1.57, 0.0]
+CORNER_2 = [ 0.5, -1.1, 1.1, -1.57, -1.57, 0.0]
+CORNER_3 = [-0.5, -1.1, 1.1, -1.57, -1.57, 0.0]
+
+write_output_float_register(1, vel)
+write_output_float_register(2, acc)
+movej(CORNER_1, a=acc, v=vel)
+sleep(0.8)
+movej(CORNER_2, a=acc, v=vel)
+sleep(0.8)
+movej(CORNER_3, a=acc, v=vel)
+sleep(0.8)
+movej(CORNER_1, a=acc, v=vel)
+sleep(0.8)

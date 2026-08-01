@@ -1,0 +1,65 @@
+global Point_2 = struct(p=p[-1.039048190750582, -0.8327379406866211, 0.24980303394871461, -0.0741796411319628, -1.6391233025335143, -0.9915148157996458], frame="base", q=[4.0364, -3.1289, 0.0543, 4.8235, -0.0219, -0.7677])
+global Point_1 = struct(p=p[0.5861259469564739, 1.1944759215782665, 0.27542119096259204, 3.3253213363654788, 0.2043427693073821, -2.4305270573672497], frame="base", q=[4.0368, -0.1162, 0.0791, 4.7188, -0.0182, -0.7677])
+global Point = struct(p=p[0.2859676018627967, 0.5205408205771903, 0.5435587494028706, 3.127617946792598, 0.012152995505176085, 0.9562150693196269], frame="base", q=[3.979, -1.7575, 2.1217, 3.8327, -1.9095, -0.8317])
+global Point_3 = struct(p=p[-0.11447147311520875, -0.7880159161270803, 1.1066511151479266, -0.7994665126969915, 2.978880874862002, -2.144310542362374], frame="base", q=[1.1866, -1.3845, 0.9645, 3.7913, -1.4381, -0.8031])
+global Point_4 = struct(p=p[0.454276278818338, 0.6398562764740461, 0.33502800276115957, -0.6269384981529273, 2.930197107064513, -0.028012009906131678], frame="base", q=[1.1965, -2.1778, -1.3709, 2.0433, -1.438, -0.8011])
+global Point_5 = struct(p=p[-0.12903054208268988, 0.19405284500888895, 1.0058566579328079, 2.330596598283303, -1.0870382876028428, -1.3593733908101373], frame="base", q=[3.1062, -2.2293, 1.1507, 0.5001, -1.4379, -0.8011])
+$ 1 "ur-program"
+$ 2 "ur-modules"
+$ 3 "ur-functions"
+$ 4 "ur-before-start"
+$ 5 "ur-assignment"
+global vel = 100
+$ 6 "ur-assignment"
+global acc = 100
+$ 7 "ur-code"
+while (True):
+  $ 8 "ur-script"
+  write_output_float_register(1,vel)
+  $ 9 "ur-script"
+  write_output_float_register(2,acc)
+  $ 10 "ur-loop"
+  Loop = 0
+  while (Loop < 2):
+    $ 11 "ur-wait"
+    sleep(0.75)
+    $ 12 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_2.p, Point_2.frame, "base"), qnear=Point_2.q), a=acc, v=vel)
+    $ 13 "ur-wait"
+    sleep(0.75)
+    $ 14 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_1.p, Point_1.frame, "base"), qnear=Point_1.q), a=acc, v=vel)
+    Loop = Loop + 1
+  end
+  $ 15 "ur-loop"
+  Loop_1 = 0
+  while (Loop_1 < 2):
+    $ 16 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point.p, Point.frame, "base"), qnear=Point.q), a=acc, v=vel)
+    $ 17 "ur-wait"
+    sleep(0.75)
+    $ 18 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_3.p, Point_3.frame, "base"), qnear=Point_3.q), a=acc, v=vel)
+    $ 19 "ur-wait"
+    sleep(0.75)
+    $ 20 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_4.p, Point_4.frame, "base"), qnear=Point_4.q), a=acc, v=vel)
+    $ 21 "ur-wait"
+    sleep(0.75)
+    $ 22 "ur-joint-move"
+    set_tcp(p[0, 0, 0, 0, 0, 0], "Tool_flange")
+    movej(get_inverse_kin(convert_pose(Point_5.p, Point_5.frame, "base"), qnear=Point_5.q), a=acc, v=vel)
+    $ 23 "ur-wait"
+    sleep(0.75)
+    Loop_1 = Loop_1 + 1
+  end
+  $ 24 "ur-assignment"
+  acc = floor(random()*990)+10
+  $ 25 "ur-assignment"
+  vel = floor(random()*990)+10
+end
