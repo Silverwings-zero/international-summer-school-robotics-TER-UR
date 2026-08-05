@@ -53,8 +53,11 @@ python run.py --mode params --script scripts/triangle.script --model models/dist
 # 4. run baseline and optimized on the robot, compare
 python send.py --robot-ip 127.0.0.1 --script scripts/triangle.script --loop 10 --out baseline.csv
 python send.py --robot-ip 127.0.0.1 --script scripts/triangle.optimized.script --loop 10 --out optimized.csv
+
+# 5. run the analysis scripts to compare your results
 python analysis.py --csv baseline.csv --joint 0
 python analysis.py --csv optimized.csv --joint 0
+# note: you might notice something is off. Is the pipeline not finished?
 ```
 
 For **path** mode, use `--mode path` in steps 2 and 3, then stream the result:
