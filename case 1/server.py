@@ -27,12 +27,14 @@ Prompting guidance for MCP clients (important for reliable tool use):
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 import threading
 import time
 import uuid
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from fastmcp import FastMCP
 
@@ -113,6 +115,8 @@ _FRAME_NAMES = ("shoulder", "elbow", "wrist1", "wrist2", "wrist3", "tool")
 _TRAJECTORY_JOBS_LOCK = threading.Lock()
 _TRAJECTORY_JOBS: dict[str, "TrajectoryJob"] = {}
 _MAX_STORED_PROGRESS_SAMPLES = 500
+_WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name("waypoints_lookup_table.json")
+_WAYPOINT_BANK_LOCK = threading.Lock()
 
 
 @dataclass
@@ -296,6 +300,52 @@ def _validate_ur_variable_name(name: str) -> str:
             "and do not start with a digit."
         )
     return candidate
+
+
+def _load_waypoint_bank() -> dict:
+    """Load local waypoint bank or create an empty in-memory structure."""
+    if not _WAYPOINT_LOOKUP_TABLE_PATH.exists():
+        return {
+            "pose_variables": {},
+            "joint_variables": {},
+        }
+    try:
+        data = json.loads(_WAYPOINT_LOOKUP_TABLE_PATH.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"waypoints_lookup_table.json is invalid JSON: {_WAYPOINT_LOOKUP_TABLE_PATH} ({exc})."
+        ) from exc
+    if not isinstance(data, dict):
+        raise ValueError("waypoints_lookup_table.json root must be an object.")
+    if "pose_variables" not in data or not isinstance(data["pose_variables"], dict):
+        data["pose_variables"] = {}
+    if "joint_variables" not in data or not isinstance(data["joint_variables"], dict):
+        data["joint_variables"] = {}
+    return data
+
+
+def _write_waypoint_bank(data: dict) -> None:
+    """Write local waypoint bank to disk."""
+    _WAYPOINT_LOOKUP_TABLE_PATH.write_text(
+        json.dumps(data, indent=2, sort_keys=False) + "\n",
+        encoding="utf-8",
+    )
+
+
+def _save_pose_to_waypoint_bank(name: str, values_m_rad: list[float]) -> None:
+    """Create or update one pose waypoint entry in waypoints_lookup_table.json."""
+    with _WAYPOINT_BANK_LOCK:
+        bank = _load_waypoint_bank()
+        bank["pose_variables"][name] = [float(v) for v in values_m_rad]
+        _write_waypoint_bank(bank)
+
+
+def _save_joint_to_waypoint_bank(name: str, values_rad: list[float]) -> None:
+    """Create or update one joint waypoint entry in waypoints_lookup_table.json."""
+    with _WAYPOINT_BANK_LOCK:
+        bank = _load_waypoint_bank()
+        bank["joint_variables"][name] = [float(v) for v in values_rad]
+        _write_waypoint_bank(bank)
 
 
 def _fk_points(q_rad: list[float]) -> list[tuple[float, float, float]]:
@@ -1223,13 +1273,15 @@ def store_waypoint_pose_on_ur(
             )
         values = [float(v) for v in tcp_pose_m_rad]
     robot.define_pose_variable(name, values)
+    _save_pose_to_waypoint_bank(name, values)
     return {
         "status": "stored_on_ur",
         "tool": "store_waypoint_pose_on_ur",
         "variable_name": name,
         "pose_type": "tcp",
         "value_m_rad": [round(v, 6) for v in values],
-        "storage": "ur_controller_variable",
+        "storage": "ur_controller_variable + waypoints_lookup_table",
+        "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
         "waypoint_compatible": True,
         "recommended_program_use": "PolyScope Variable Waypoint",
     }
@@ -1264,6 +1316,7 @@ def store_joint_configuration_on_ur(
     else:
         q_rad = _checked_joint_target([float(v) for v in joint_angles_deg])
     robot.define_joint_variable(name, q_rad)
+    _save_joint_to_waypoint_bank(name, q_rad)
     return {
         "status": "stored_on_ur",
         "tool": "store_joint_configuration_on_ur",
@@ -1271,7 +1324,8 @@ def store_joint_configuration_on_ur(
         "pose_type": "joints",
         "value_rad": [round(v, 6) for v in q_rad],
         "value_deg": [round(math.degrees(v), 3) for v in q_rad],
-        "storage": "ur_controller_variable",
+        "storage": "ur_controller_variable + waypoints_lookup_table",
+        "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
         "waypoint_compatible": False,
         "recommended_program_use": "Joint configuration/reference data",
     }
