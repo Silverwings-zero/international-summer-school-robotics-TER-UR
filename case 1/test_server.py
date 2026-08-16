@@ -32,7 +32,12 @@ HOME_DEG = [0, -90, 0, -90, 0, 0]
 
 REQUIRED_TOOLS = {
     "move_robot_to_position", "get_robot_state", "move_joints_relative",
-    "move_linear", "run_trajectory", "set_gripper", "example",
+    "move_linear", "run_trajectory", "start_trajectory_job",
+    "get_trajectory_job_status", "move_joint", "set_gripper", "set_payload",
+    "set_payload_mass", "set_gravity", "get_digital_in", "set_digital_out",
+    "store_waypoint_pose_on_ur", "store_joint_configuration_on_ur",
+    "move_to_stored_tcp_waypoint", "move_to_stored_joint_configuration",
+    "example",
 }
 
 
@@ -83,12 +88,22 @@ async def main() -> None:
         assert pose.data["status"] == "reached"
         print("move pose:", pose.data["joints_deg"])
 
+        # Alias compatibility: move_joint should behave exactly like
+        # move_robot_to_position.
+        alias_pose = await client.call_tool(
+            "move_joint", {"joint_angles_deg": [15, -90, 0, -90, 0, 0]}
+        )
+        assert alias_pose.data["status"] == "reached"
+        print("move_joint alias:", alias_pose.data["joints_deg"])
+
         # --- Gold: relative move ------------------------------------------ #
+        base_before_rel = alias_pose.data["joints_deg"]["base"]
         rel = await client.call_tool(
             "move_joints_relative", {"delta_deg": [10, 0, 0, 0, 0, 0]}
         )
         assert rel.data["status"] == "reached"
-        assert abs(rel.data["joints_deg"]["base"] - 20) < 1, rel.data
+        expected_base = base_before_rel + 10
+        assert abs(rel.data["joints_deg"]["base"] - expected_base) < 1, rel.data
         print("relative move: base ->", rel.data["joints_deg"]["base"])
 
         # --- Gold: linear move (straight-line TCP, down 10 cm and back) --- #
@@ -98,7 +113,7 @@ async def main() -> None:
         bent = await client.call_tool(
             "move_robot_to_position", {"joint_angles_deg": [20, -70, 45, -65, -30, 0]}
         )
-        tcp = bent.data["tcp_pose"]
+        tcp = bent.data["tcp_pose_m_rad"]
         down = await client.call_tool(
             "move_linear", {"position_m": [tcp[0], tcp[1], tcp[2] - 0.10]}
         )
@@ -122,6 +137,99 @@ async def main() -> None:
         print(f"trajectory: {traj.data['waypoints']} waypoints in "
               f"{traj.data['duration_s']}s, {len(traj.data['motion_log'])} "
               f"samples, peak {traj.data['peak_joint_speed_rad_s']} rad/s")
+
+        # --- Gold: async trajectory job with incremental progress --------- #
+        started = await client.call_tool("start_trajectory_job", {
+            "waypoints_deg": [[30, -80, 20, -85, 0, 0], HOME_DEG],
+            "blend_m": 0.0,
+        })
+        job_id = started.data["job_id"]
+        next_index = 0
+        saw_progress = False
+        final_status = None
+        final_result = None
+        for _ in range(240):
+            status = await client.call_tool("get_trajectory_job_status", {
+                "job_id": job_id,
+                "from_index": next_index,
+                "limit": 20,
+            })
+            chunk = status.data["progress_samples"]
+            if chunk:
+                saw_progress = True
+            next_index = status.data["next_index"]
+            final_status = status.data["status"]
+            if final_status in ("completed", "failed"):
+                final_result = status.data.get("result")
+                break
+            await asyncio.sleep(0.25)
+        assert final_status == "completed", (
+            f"trajectory job did not complete successfully: {final_status}")
+        assert saw_progress, "trajectory job produced no incremental progress"
+        assert final_result and final_result["status"] == "reached"
+        print("trajectory job: completed with", next_index, "progress samples")
+
+        # --- Silver/Gold: store + immediate reuse across calls ----------- #
+        stored_tcp = await client.call_tool("store_waypoint_pose_on_ur", {
+            "variable_name": "tmp_waypoint_now",
+        })
+        assert stored_tcp.data["status"] == "stored_on_ur"
+        moved_tcp = await client.call_tool("move_to_stored_tcp_waypoint", {
+            "variable_name": "tmp_waypoint_now",
+            "speed": 0.2,
+            "acceleration": 1.0,
+            "timeout_s": 20.0,
+        })
+        assert moved_tcp.data["status"] == "executed"
+
+        stored_q = await client.call_tool("store_joint_configuration_on_ur", {
+            "variable_name": "tmp_joint_now",
+        })
+        assert stored_q.data["status"] == "stored_on_ur"
+        moved_q = await client.call_tool("move_to_stored_joint_configuration", {
+            "variable_name": "tmp_joint_now",
+            "speed": 0.8,
+            "acceleration": 1.0,
+            "timeout_s": 20.0,
+        })
+        assert moved_q.data["status"] == "executed"
+        print("stored variables: immediate waypoint + joint reuse confirmed")
+
+        # --- Silver: commissioning/utility tools + input validation ------- #
+        payload = await client.call_tool("set_payload", {
+            "mass_kg": 0.5,
+            "cog_m": [0.0, 0.0, 0.02],
+        })
+        assert payload.data["status"] == "applied"
+        assert abs(payload.data["mass_kg"] - 0.5) < 1e-9
+        print("set_payload:", payload.data)
+
+        payload_mass = await client.call_tool("set_payload_mass", {
+            "mass_kg": 0.25,
+        })
+        assert payload_mass.data["status"] == "applied"
+        assert abs(payload_mass.data["mass_kg"] - 0.25) < 1e-9
+        print("set_payload_mass:", payload_mass.data)
+
+        gravity = await client.call_tool("set_gravity", {
+            "gravity_m_s2": [0.0, 0.0, -9.82],
+        })
+        assert gravity.data["status"] == "applied"
+        assert abs(gravity.data["magnitude_m_s2"] - 9.82) < 0.05
+        print("set_gravity:", gravity.data)
+
+        await expect_rejection(
+            client, "set_payload", {"mass_kg": -1.0},
+            "payload-negative-mass", must_contain="non-negative")
+        await expect_rejection(
+            client, "set_payload", {"mass_kg": 0.2, "cog_m": [0.0, 0.0]},
+            "payload-bad-cog", must_contain="Expected cog_m")
+        await expect_rejection(
+            client, "set_payload", {"mass_kg": 12.5, "cog_m": [0.6, 0.9, 0.5]},
+            "payload-bad-cog", must_contain="Invalid CoG")
+        await expect_rejection(
+            client, "set_gravity", {"gravity_m_s2": [0.0, 0.0, -1.0]},
+            "gravity-magnitude", must_contain="looks invalid")
 
         # --- Diamond: the safety layer must block unsafe commands --------- #
         await expect_rejection(

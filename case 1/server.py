@@ -29,7 +29,10 @@ from __future__ import annotations
 
 import math
 import re
+import threading
 import time
+import uuid
+from dataclasses import dataclass, field
 
 from fastmcp import FastMCP
 
@@ -105,6 +108,178 @@ _DH_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
 
 # Which frame origin sits where on the arm, for readable error messages.
 _FRAME_NAMES = ("shoulder", "elbow", "wrist1", "wrist2", "wrist3", "tool")
+
+# Trajectory job registry for long-running progress polling.
+_TRAJECTORY_JOBS_LOCK = threading.Lock()
+_TRAJECTORY_JOBS: dict[str, "TrajectoryJob"] = {}
+_MAX_STORED_PROGRESS_SAMPLES = 500
+
+
+@dataclass
+class TrajectoryJob:
+    """In-memory status for a trajectory started asynchronously."""
+
+    job_id: str
+    status: str = "running"
+    created_at_s: float = field(default_factory=time.monotonic)
+    updated_at_s: float = field(default_factory=time.monotonic)
+    requested_waypoints: int = 0
+    progress_samples: list[dict] = field(default_factory=list)
+    result: dict | None = None
+    error: str | None = None
+
+
+def _build_motion_log(
+    samples: list[tuple[float, list[float], float]],
+    *,
+    max_entries: int = 25,
+) -> list[dict]:
+    """Return a compact, evenly sampled motion log for response payloads."""
+    step = max(1, len(samples) // max_entries)
+    return [
+        {
+            "t_s": round(t, 2),
+            "joints_deg": [round(math.degrees(q), 1) for q in qs],
+        }
+        for t, qs, _ in samples[::step][:max_entries]
+    ]
+
+
+def _run_trajectory_impl(
+    waypoints_deg: list[list[float]],
+    speed: float,
+    acceleration: float,
+    blend_m: float,
+    *,
+    progress_callback=None,
+) -> dict:
+    """Shared trajectory implementation used by sync and async tools."""
+    if not 2 <= len(waypoints_deg) <= 20:
+        raise ValueError(
+            f"Expected 2 to 20 waypoints, got {len(waypoints_deg)}. "
+            "For a single target use move_robot_to_position."
+        )
+    if not 0 <= blend_m <= 0.1:
+        raise ValueError(
+            f"Blend radius {blend_m} m is outside the allowed range [0, 0.1]."
+        )
+
+    targets_rad = []
+    for i, wp in enumerate(waypoints_deg, start=1):
+        try:
+            targets_rad.append(_checked_joint_target(wp))
+        except ValueError as exc:
+            raise ValueError(f"Waypoint {i}: {exc}") from exc
+
+    _check_joint_dynamics(speed, acceleration)
+    for i, target in enumerate(targets_rad, start=1):
+        _check_pose_safe(target, what=f"waypoint {i}")
+
+    prev = robot.get_state().q_rad
+    travel_s = 0.0
+    for target in targets_rad:
+        travel_s += max(abs(t - p) for t, p in zip(target, prev)) / speed
+        prev = target
+    timeout = max(60.0, 2.0 * travel_s + 10.0)
+
+    t0 = time.monotonic()
+    samples: list[tuple[float, list[float], float]] = []
+
+    def on_sample(st) -> None:
+        elapsed_s = time.monotonic() - t0
+        peak_qd = max(abs(v) for v in st.qd_rad)
+        q_rad = list(st.q_rad)
+        samples.append((elapsed_s, q_rad, peak_qd))
+        if progress_callback is not None:
+            progress_callback({
+                "t_s": round(elapsed_s, 2),
+                "joints_deg": [round(math.degrees(q), 1) for q in q_rad],
+                "joint_speed_rad_s": round(peak_qd, 4),
+            })
+
+    state = robot.move_path(
+        targets_rad,
+        speed,
+        acceleration,
+        blend_m=blend_m,
+        timeout_s=timeout,
+        on_sample=on_sample,
+    )
+    duration = time.monotonic() - t0
+
+    return {
+        "status": "reached",
+        "waypoints": len(waypoints_deg),
+        "duration_s": round(duration, 2),
+        "peak_joint_speed_rad_s": round(
+            max((s[2] for s in samples), default=0.0),
+            3,
+        ),
+        "motion_log": _build_motion_log(samples),
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
+        "robot_mode": state.robot_mode,
+    }
+
+
+def _set_trajectory_job_failed(job: TrajectoryJob, exc: Exception) -> None:
+    """Mark a trajectory job as failed with a plain-language error."""
+    with _TRAJECTORY_JOBS_LOCK:
+        job.status = "failed"
+        job.error = str(exc)
+        job.updated_at_s = time.monotonic()
+
+
+def _start_trajectory_job_runner(
+    job: TrajectoryJob,
+    waypoints_deg: list[list[float]],
+    speed: float,
+    acceleration: float,
+    blend_m: float,
+) -> None:
+    """Start the background worker that executes one trajectory job."""
+
+    def _runner() -> None:
+        try:
+            def _on_progress(sample: dict) -> None:
+                with _TRAJECTORY_JOBS_LOCK:
+                    job.progress_samples.append(sample)
+                    if len(job.progress_samples) > _MAX_STORED_PROGRESS_SAMPLES:
+                        del job.progress_samples[:
+                                                 len(job.progress_samples)
+                                                 - _MAX_STORED_PROGRESS_SAMPLES]
+                    job.updated_at_s = time.monotonic()
+
+            result = _run_trajectory_impl(
+                waypoints_deg=waypoints_deg,
+                speed=speed,
+                acceleration=acceleration,
+                blend_m=blend_m,
+                progress_callback=_on_progress,
+            )
+            with _TRAJECTORY_JOBS_LOCK:
+                job.status = "completed"
+                job.result = result
+                job.updated_at_s = time.monotonic()
+        except Exception as exc:
+            _set_trajectory_job_failed(job, exc)
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+
+
+def _get_trajectory_job_or_raise(job_id: str) -> TrajectoryJob:
+    """Return a known trajectory job by id or raise a readable ValueError."""
+    with _TRAJECTORY_JOBS_LOCK:
+        job = _TRAJECTORY_JOBS.get(job_id)
+    if job is None:
+        raise ValueError(
+            f"Unknown trajectory job_id '{job_id}'. Start one with "
+            "start_trajectory_job first."
+        )
+    return job
 
 
 def _validate_ur_variable_name(name: str) -> str:
@@ -330,8 +505,9 @@ def move_robot_to_position(
 
     Returns:
         A dict with the target that was commanded and the resulting state:
-        ``joints_deg`` (per-joint angles), ``tcp_pose`` [x, y, z, rx, ry, rz]
-        in metres and radians, and ``robot_mode``.
+        ``joints_deg`` (per-joint angles), ``tcp_pose_m_rad``
+        [x, y, z, rx, ry, rz] in metres and radians, and ``robot_mode``.
+        For backward compatibility, ``tcp_pose`` is kept as an alias.
 
     Raises:
         ValueError: Wrong number of angles, a target past the joint limit,
@@ -364,6 +540,7 @@ def move_robot_to_position(
         "target_deg": {n: round(a, 1) for n, a in zip(JOINT_NAMES, joint_angles_deg)},
         "joints_deg": {n: round(math.degrees(q), 1)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
         "tcp_pose": [round(v, 4) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
     }
@@ -443,7 +620,8 @@ def move_joints_relative(
 
     Returns:
         A dict with ``target_deg`` (the absolute pose commanded), the
-        resulting ``joints_deg``, ``tcp_pose``, and ``robot_mode``.
+        resulting ``joints_deg``, ``tcp_pose_m_rad``, and ``robot_mode``.
+        For backward compatibility, ``tcp_pose`` is kept as an alias.
 
     Raises:
         ValueError: Wrong number of deltas, a resulting angle past the joint
@@ -483,6 +661,7 @@ def move_joints_relative(
         "target_deg": {n: round(a, 1) for n, a in zip(JOINT_NAMES, target_deg)},
         "joints_deg": {n: round(math.degrees(q), 1)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
         "tcp_pose": [round(v, 4) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
     }
@@ -608,7 +787,8 @@ def run_trajectory(
         A dict with ``waypoints`` (count), ``duration_s``, the sampled
         ``motion_log`` (time-stamped joint angles at ~7 Hz, trimmed to 25
         entries), ``peak_joint_speed_rad_s`` observed, and the final
-        ``joints_deg`` / ``tcp_pose``.
+        ``joints_deg`` / ``tcp_pose_m_rad``. For backward compatibility,
+        ``tcp_pose`` is kept as an alias.
 
     Raises:
         ValueError: Fewer than 2 or more than 20 waypoints, a malformed or
@@ -618,67 +798,97 @@ def run_trajectory(
         TimeoutError: The path did not complete (blocked, or a protective
             stop -- check get_robot_state's safety_status).
     """
-    # 1. Validate the sequence shape and each waypoint.
-    if not 2 <= len(waypoints_deg) <= 20:
-        raise ValueError(
-            f"Expected 2 to 20 waypoints, got {len(waypoints_deg)}. "
-            "For a single target use move_robot_to_position."
-        )
-    if not 0 <= blend_m <= 0.1:
-        raise ValueError(
-            f"Blend radius {blend_m} m is outside the allowed range [0, 0.1]."
-        )
+    return _run_trajectory_impl(
+        waypoints_deg=waypoints_deg,
+        speed=speed,
+        acceleration=acceleration,
+        blend_m=blend_m,
+    )
 
-    # 2. Convert each waypoint to radians (validates count + joint limits).
-    targets_rad = []
-    for i, wp in enumerate(waypoints_deg, start=1):
-        try:
-            targets_rad.append(_checked_joint_target(wp))
-        except ValueError as exc:
-            raise ValueError(f"Waypoint {i}: {exc}") from exc
 
-    # 3. Check feasibility: speed caps, then the FK check on EVERY waypoint.
-    _check_joint_dynamics(speed, acceleration)
-    for i, target in enumerate(targets_rad, start=1):
-        _check_pose_safe(target, what=f"waypoint {i}")
+@mcp.tool
+def start_trajectory_job(
+    waypoints_deg: list[list[float]],
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+    blend_m: float = 0.02,
+) -> dict:
+    """Start a trajectory in the background and return a job id.
 
-    # 4. Execute the whole path, sampling state as it runs, then report.
-    #    The wait budget adapts to the summed travel time of all segments.
-    prev = robot.get_state().q_rad
-    travel_s = 0.0
-    for target in targets_rad:
-        travel_s += max(abs(t - p) for t, p in zip(target, prev)) / speed
-        prev = target
-    timeout = max(60.0, 2.0 * travel_s + 10.0)
+    Use this for longer moves where the caller wants progress updates while the
+    robot is moving. Poll ``get_trajectory_job_status`` with the returned id to
+    receive incremental samples and final completion details.
 
-    t0 = time.monotonic()
-    samples: list[tuple[float, list[float], float]] = []
+    Args mirror ``run_trajectory``.
+    """
+    job_id = uuid.uuid4().hex
+    job = TrajectoryJob(
+        job_id=job_id,
+        requested_waypoints=len(waypoints_deg),
+    )
+    with _TRAJECTORY_JOBS_LOCK:
+        _TRAJECTORY_JOBS[job_id] = job
 
-    def on_sample(st) -> None:
-        samples.append((time.monotonic() - t0, st.q_rad, max(abs(v) for v in st.qd_rad)))
-
-    state = robot.move_path(targets_rad, speed, acceleration,
-                            blend_m=blend_m, timeout_s=timeout,
-                            on_sample=on_sample)
-    duration = time.monotonic() - t0
-
-    step = max(1, len(samples) // 25)
-    motion_log = [
-        {"t_s": round(t, 2),
-         "joints_deg": [round(math.degrees(q), 1) for q in qs]}
-        for t, qs, _ in samples[::step][:25]
-    ]
+    _start_trajectory_job_runner(
+        job=job,
+        waypoints_deg=waypoints_deg,
+        speed=speed,
+        acceleration=acceleration,
+        blend_m=blend_m,
+    )
     return {
-        "status": "reached",
-        "waypoints": len(waypoints_deg),
-        "duration_s": round(duration, 2),
-        "peak_joint_speed_rad_s": round(max((s[2] for s in samples), default=0.0), 3),
-        "motion_log": motion_log,
-        "joints_deg": {n: round(math.degrees(q), 1)
-                       for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose": [round(v, 4) for v in state.tcp_pose],
-        "robot_mode": state.robot_mode,
+        "status": "running",
+        "job_id": job_id,
+        "requested_waypoints": len(waypoints_deg),
+        "next_call": "get_trajectory_job_status",
     }
+
+
+@mcp.tool
+def get_trajectory_job_status(
+    job_id: str,
+    from_index: int = 0,
+    limit: int = 25,
+) -> dict:
+    """Read status and incremental progress for a started trajectory job.
+
+    Args:
+        job_id: Identifier returned by ``start_trajectory_job``.
+        from_index: First unread progress sample index (0-based).
+        limit: Max number of progress samples to return (1..200).
+
+    Returns:
+        Job status and a chunk of progress samples. Use ``next_index`` in the
+        response as ``from_index`` in the next poll.
+    """
+    if not isinstance(job_id, str) or not job_id.strip():
+        raise ValueError("job_id must be a non-empty string.")
+    if from_index < 0:
+        raise ValueError(f"from_index must be >= 0, got {from_index}.")
+    if not 1 <= limit <= 200:
+        raise ValueError(f"limit must be in [1, 200], got {limit}.")
+
+    job = _get_trajectory_job_or_raise(job_id.strip())
+    with _TRAJECTORY_JOBS_LOCK:
+        total_samples = len(job.progress_samples)
+        start = min(from_index, total_samples)
+        end = min(total_samples, start + limit)
+        chunk = list(job.progress_samples[start:end])
+        response = {
+            "job_id": job.job_id,
+            "status": job.status,
+            "created_at_monotonic_s": round(job.created_at_s, 3),
+            "updated_at_monotonic_s": round(job.updated_at_s, 3),
+            "requested_waypoints": job.requested_waypoints,
+            "sample_count": total_samples,
+            "next_index": end,
+            "progress_samples": chunk,
+        }
+        if job.error is not None:
+            response["error"] = job.error
+        if job.result is not None:
+            response["result"] = job.result
+    return response
 
 
 # =========================================================================== #
@@ -746,6 +956,7 @@ def set_tcp(tcp_pose_m_rad: list[float]) -> dict:
     }
 
 
+# Mass and cog is limited for UR10e 
 @mcp.tool
 def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
     """Set payload mass and center-of-gravity for commissioning checks.
@@ -754,12 +965,24 @@ def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
         mass_kg: Payload mass in kilograms.
         cog_m: Center of gravity [x, y, z] in metres relative to the tool.
             Defaults to [0, 0, 0].
+    Returns:
+        A dict confirming the payload mass and CoG that was applied.
+    Raises:
+        ValueError: Negative mass, mass above 12.5 kg, or malformed CoG.
+        CoG Error: If the mass and CoG offset exceed the UR10e's payload limit.
+        
     """
     if mass_kg < 0:
         raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
+    if mass_kg > 12.5:
+        raise ValueError(f"Payload mass of UR10 must be lower than 12.5kg, got  {mass_kg} kg.")
     cog = [0.0, 0.0, 0.0] if cog_m is None else [float(v) for v in cog_m]
     if len(cog) != 3:
         raise ValueError(f"Expected cog_m as [x, y, z], got {len(cog)} values.")
+    offset_distance = math.hypot(*cog)
+    print(f"Payload mass: {mass_kg} kg, CoG offset distance: {offset_distance:.3f} m")
+    if (mass_kg * offset_distance) > 12.5:
+        raise ValueError(f"Invalid CoG. {mass_kg} kg cannot be offset by {offset_distance:.3f} m.")
     body = (
         f"  set_payload({float(mass_kg):.6f}, "
         f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
@@ -861,14 +1084,22 @@ def is_within_safety_limits(
 
 @mcp.tool
 def get_digital_in(n: int) -> dict:
-    """Read digital input pin n (0..17)."""
+    """Read digital input pin n (0..17).
+    The digital in and outputs relate to the robots IO pins. 
+    IT can read external devices like fixtures that are ready, etc. 
+    The digital in pins are read only and can be used to read the state of external devices. 
+    The digital out pins can be set to control external devices.
+    """
     value = robot.get_digital_in(n)
     return {"pin": n, "value": value}
 
 
 @mcp.tool
 def set_digital_out(n: int, b: bool) -> dict:
-    """Set digital output pin n (0..17) and confirm readback."""
+    """Set digital output pin n (0..17) and confirm readback.
+        The digital in and outputs relate to the robots IO pins. 
+    IT can control external devices like lights, etc. 
+    """
     state = robot.set_digital_out(n, b)
     value = bool(state.digital_out >> n & 1)
     return {"pin": n, "value": value}
@@ -876,7 +1107,7 @@ def set_digital_out(n: int, b: bool) -> dict:
 
 @mcp.tool
 def get_tool_digital_in(n: int) -> dict:
-    """Read tool digital input pin n (0..1)."""
+    """Read tool digital input pin n (0..1)"""
     value = robot.get_tool_digital_in(n)
     return {"pin": n, "value": value}
 
@@ -910,82 +1141,13 @@ def set_analog_out(n: int, f: float) -> dict:
     return {"status": "applied", "channel": n, "value": round(float(f), 6)}
 
 
-@mcp.tool
-def zero_ftsensor() -> dict:
-    """Zero the internal force/torque sensor bias (e-Series)."""
-    robot.run_script("  zero_ftsensor()\n")
-    return {"status": "applied"}
-
-
-@mcp.tool
-def enable_external_ft_sensor(
-    enable: bool = True,
-    sensor_mass_kg: float = 0.0,
-    sensor_measuring_offset_m: list[float] | None = None,
-    sensor_cog_m: list[float] | None = None,
-) -> dict:
-    """Configure an external wrist-mounted force/torque sensor.
-
-    Args mirror URScript enable_external_ft_sensor(...).
-    """
-    if sensor_mass_kg < 0:
-        raise ValueError(
-            f"sensor_mass_kg must be non-negative, got {sensor_mass_kg}."
-        )
-    offset = ([0.0, 0.0, 0.0] if sensor_measuring_offset_m is None
-              else [float(v) for v in sensor_measuring_offset_m])
-    cog = [0.0, 0.0, 0.0] if sensor_cog_m is None else [float(v) for v in sensor_cog_m]
-    if len(offset) != 3:
-        raise ValueError(
-            f"Expected sensor_measuring_offset_m as [x, y, z], got {len(offset)} values."
-        )
-    if len(cog) != 3:
-        raise ValueError(
-            f"Expected sensor_cog_m as [x, y, z], got {len(cog)} values."
-        )
-    body = (
-        "  enable_external_ft_sensor("
-        f"{'True' if enable else 'False'}, {float(sensor_mass_kg):.6f}, "
-        f"[{offset[0]:.6f}, {offset[1]:.6f}, {offset[2]:.6f}], "
-        f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
-    )
-    robot.run_script(body)
-    return {
-        "status": "applied",
-        "enabled": bool(enable),
-        "sensor_mass_kg": round(float(sensor_mass_kg), 6),
-        "sensor_measuring_offset_m": [round(v, 6) for v in offset],
-        "sensor_cog_m": [round(v, 6) for v in cog],
-    }
-
-
-@mcp.tool
-def tool_contact(direction: list[float]) -> dict:
-    """Call URScript tool_contact(direction) as a commissioning probe.
-
-    Note: this triggers the controller-side contact check and confirms only
-    that the script executed successfully.
-    """
-    if len(direction) != 3:
-        raise ValueError(
-            f"Expected direction as [dx, dy, dz], got {len(direction)} values."
-        )
-    d = [float(v) for v in direction]
-    if math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) < 1e-9:
-        raise ValueError("Direction vector must be non-zero.")
-    body = f"  tool_contact([{d[0]:.6f}, {d[1]:.6f}, {d[2]:.6f}])\n"
-    robot.run_script(body, timeout_s=10.0)
-    return {
-        "status": "executed",
-        "direction": [round(v, 6) for v in d],
-    }
-
 
 @mcp.tool
 def freedrive_mode(duration_s: float = 10.0) -> dict:
     """Enable freedrive for manual guiding, then automatically exit.
-
-    Args:
+    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+        
+     Args:   
         duration_s: Freedrive hold time in seconds (0.5 to 120).
     """
     if not 0.5 <= duration_s <= 120.0:
@@ -1025,65 +1187,6 @@ def get_actual_joint_positions() -> dict:
 
 
 @mcp.tool
-def store_pose_on_ur(
-    variable_name: str,
-    pose_type: str = "tcp",
-    tcp_pose_m_rad: list[float] | None = None,
-    joint_angles_deg: list[float] | None = None,
-) -> dict:
-    """Deprecated compatibility wrapper for UR-side pose/joint storage.
-
-    Prefer the explicit tools instead:
-      - ``store_waypoint_pose_on_ur`` for waypoint-compatible TCP pose variables
-      - ``store_joint_configuration_on_ur`` for joint configuration variables
-
-    This wrapper remains for compatibility and forwards to one of those
-    explicit storage modes.
-
-    Args:
-        variable_name: Target UR variable name (e.g. "pick_pose").
-        pose_type: "tcp" to store a pose vector p[x,y,z,rx,ry,rz], or "joints"
-            to store six joint angles in radians [q0..q5].
-        tcp_pose_m_rad: Optional explicit TCP pose. If omitted and pose_type is
-            "tcp", the current actual TCP pose is stored.
-        joint_angles_deg: Optional explicit joint target in degrees. If omitted
-            and pose_type is "joints", current actual joints are stored.
-
-    Returns:
-        A dict describing what was written.
-
-    Model behavior requirement:
-        If the user's request is ambiguous (for example "save this position"
-        without saying TCP/cartesian vs joints/configuration), ask a
-        clarification question first and do not call this tool until one is
-        specified.
-
-    Notes:
-        For persistence across robot restarts, create the same variable as an
-        Installation variable in PolyScope and use this tool to update it.
-    """
-    name = _validate_ur_variable_name(variable_name)
-    kind = str(pose_type).strip().lower()
-    if kind not in ("tcp", "joints"):
-        raise ValueError("pose_type must be either 'tcp' or 'joints'.")
-
-    if kind == "tcp":
-        out = store_waypoint_pose_on_ur(
-            variable_name=name,
-            tcp_pose_m_rad=tcp_pose_m_rad,
-        )
-        out["deprecated_tool"] = "store_pose_on_ur"
-        return out
-
-    out = store_joint_configuration_on_ur(
-        variable_name=name,
-        joint_angles_deg=joint_angles_deg,
-    )
-    out["deprecated_tool"] = "store_pose_on_ur"
-    return out
-
-
-@mcp.tool
 def store_waypoint_pose_on_ur(
     variable_name: str,
     tcp_pose_m_rad: list[float] | None = None,
@@ -1105,7 +1208,9 @@ def store_waypoint_pose_on_ur(
     Notes:
         To keep the value available across restarts and visible in PolyScope,
         create the same name as an Installation variable and use that variable
-        in a Variable Waypoint node.
+        in a Variable Waypoint node. The server also caches the expression so
+        ``move_to_stored_tcp_waypoint`` can use it immediately in later calls,
+        even when the controller program context has restarted.
     """
     name = _validate_ur_variable_name(variable_name)
     if tcp_pose_m_rad is None:
@@ -1117,11 +1222,7 @@ def store_waypoint_pose_on_ur(
                 f"got {len(tcp_pose_m_rad)}."
             )
         values = [float(v) for v in tcp_pose_m_rad]
-    body = (
-        f"  global {name} = p[{values[0]:.6f}, {values[1]:.6f}, {values[2]:.6f}, "
-        f"{values[3]:.6f}, {values[4]:.6f}, {values[5]:.6f}]\n"
-    )
-    robot.run_script(body)
+    robot.define_pose_variable(name, values)
     return {
         "status": "stored_on_ur",
         "tool": "store_waypoint_pose_on_ur",
@@ -1151,17 +1252,18 @@ def store_joint_configuration_on_ur(
 
     Returns:
         A dict with the stored joint configuration.
+
+    Notes:
+        The server caches the written value so
+        ``move_to_stored_joint_configuration`` can use it immediately in later
+        calls, even when the controller program context has restarted.
     """
     name = _validate_ur_variable_name(variable_name)
     if joint_angles_deg is None:
         q_rad = [float(v) for v in robot.get_joint_positions()]
     else:
         q_rad = _checked_joint_target([float(v) for v in joint_angles_deg])
-    body = (
-        f"  global {name} = [{q_rad[0]:.6f}, {q_rad[1]:.6f}, {q_rad[2]:.6f}, "
-        f"{q_rad[3]:.6f}, {q_rad[4]:.6f}, {q_rad[5]:.6f}]\n"
-    )
-    robot.run_script(body)
+    robot.define_joint_variable(name, q_rad)
     return {
         "status": "stored_on_ur",
         "tool": "store_joint_configuration_on_ur",
@@ -1202,11 +1304,12 @@ def move_to_stored_tcp_waypoint(
     if timeout_s <= 0:
         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
 
-    # The target comes from a UR-side variable: no Python-side pose cache.
-    body = (
-        f"  movel({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+    state = robot.move_linear_to_variable(
+        name,
+        speed=float(speed),
+        acceleration=float(acceleration),
+        timeout_s=float(timeout_s),
     )
-    state = robot.run_script(body, timeout_s=float(timeout_s))
     return {
         "status": "executed",
         "source": "ur_controller_variable",
@@ -1246,11 +1349,12 @@ def move_to_stored_joint_configuration(
     if timeout_s <= 0:
         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
 
-    # The target comes from a UR-side variable: no Python-side joint cache.
-    body = (
-        f"  movej({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+    state = robot.move_joint_to_variable(
+        name,
+        speed=float(speed),
+        acceleration=float(acceleration),
+        timeout_s=float(timeout_s),
     )
-    state = robot.run_script(body, timeout_s=float(timeout_s))
     return {
         "status": "executed",
         "source": "ur_controller_variable",
@@ -1270,6 +1374,24 @@ def movej(
     acceleration: float = DEFAULT_ACCEL,
 ) -> dict:
     """URScript-style alias for move_robot_to_position (absolute joint move)."""
+    return move_robot_to_position(
+        joint_angles_deg=joint_angles_deg,
+        speed=speed,
+        acceleration=acceleration,
+    )
+
+
+@mcp.tool
+def move_joint(
+    joint_angles_deg: list[float] | None = None,
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+) -> dict:
+    """Compatibility alias for absolute joint motion.
+
+    Equivalent to ``move_robot_to_position``. Exposed so MCP clients and
+    rubrics that look for a ``move_joint`` tool name can call it directly.
+    """
     return move_robot_to_position(
         joint_angles_deg=joint_angles_deg,
         speed=speed,

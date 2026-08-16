@@ -20,6 +20,7 @@ import math
 import os
 import socket
 import struct
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -81,6 +82,20 @@ class URClient:
     """
 
     host: str = field(default_factory=lambda: os.environ.get("UR_HOST", "127.0.0.1"))
+    _ur_variable_expr: dict[str, str] = field(default_factory=dict,
+                                               init=False, repr=False)
+    _ur_variable_lock: threading.Lock = field(default_factory=threading.Lock,
+                                              init=False, repr=False)
+
+    def _remember_ur_variable(self, name: str, expr: str) -> None:
+        """Cache a UR variable expression for immediate reuse across scripts."""
+        with self._ur_variable_lock:
+            self._ur_variable_expr[name] = expr
+
+    def _cached_ur_variable_expr(self, name: str) -> str | None:
+        """Return a cached UR variable expression, if known locally."""
+        with self._ur_variable_lock:
+            return self._ur_variable_expr.get(name)
 
     def connect(self) -> None:
         """Verify the robot is reachable, failing fast with a readable reason."""
@@ -335,6 +350,58 @@ class URClient:
             self._require_running()
         return self._run_program(body, done=lambda _st: True, timeout_s=timeout_s)
 
+    def define_pose_variable(self, name: str, pose: list[float],
+                             *, timeout_s: float = 5.0) -> RobotState:
+        """Define ``name`` as a UR pose value and cache it for later reuse."""
+        expr = (
+            f"p[{pose[0]:.6f}, {pose[1]:.6f}, {pose[2]:.6f}, "
+            f"{pose[3]:.6f}, {pose[4]:.6f}, {pose[5]:.6f}]"
+        )
+        state = self.run_script(
+            f"  global {name} = {expr}\n",
+            timeout_s=timeout_s,
+        )
+        self._remember_ur_variable(name, expr)
+        return state
+
+    def define_joint_variable(self, name: str, joints_rad: list[float],
+                              *, timeout_s: float = 5.0) -> RobotState:
+        """Define ``name`` as a UR joint list value and cache it locally."""
+        expr = (
+            f"[{joints_rad[0]:.6f}, {joints_rad[1]:.6f}, {joints_rad[2]:.6f}, "
+            f"{joints_rad[3]:.6f}, {joints_rad[4]:.6f}, {joints_rad[5]:.6f}]"
+        )
+        state = self.run_script(
+            f"  global {name} = {expr}\n",
+            timeout_s=timeout_s,
+        )
+        self._remember_ur_variable(name, expr)
+        return state
+
+    def move_linear_to_variable(self, name: str, speed: float, acceleration: float,
+                                *, timeout_s: float = 30.0) -> RobotState:
+        """Run ``movel(name, ...)`` and pre-define ``name`` from cache if known."""
+        lines = []
+        expr = self._cached_ur_variable_expr(name)
+        if expr is not None:
+            lines.append(f"  global {name} = {expr}\n")
+        lines.append(
+            f"  movel({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+        )
+        return self.run_script("".join(lines), timeout_s=timeout_s)
+
+    def move_joint_to_variable(self, name: str, speed: float, acceleration: float,
+                               *, timeout_s: float = 30.0) -> RobotState:
+        """Run ``movej(name, ...)`` and pre-define ``name`` from cache if known."""
+        lines = []
+        expr = self._cached_ur_variable_expr(name)
+        if expr is not None:
+            lines.append(f"  global {name} = {expr}\n")
+        lines.append(
+            f"  movej({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+        )
+        return self.run_script("".join(lines), timeout_s=timeout_s)
+
     @staticmethod
     def _digital_bit(bits: int, pin: int) -> bool:
         if not 0 <= pin <= 17:
@@ -427,3 +494,4 @@ class URClient:
                     "RTDE connection closed by the controller mid-message.")
             body += chunk
         return cmd, body
+
