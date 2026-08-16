@@ -47,7 +47,8 @@ _RTDE_START = 83                     # 'S'
 _RTDE_DATA_PACKAGE = 85              # 'U'
 _RTDE_OUTPUTS = (
     "actual_q,actual_qd,actual_TCP_pose,robot_mode,safety_status,"
-    "actual_digital_output_bits"
+    "actual_digital_output_bits,actual_digital_input_bits,"
+    "standard_analog_input0,standard_analog_input1"
 )
 
 
@@ -61,6 +62,8 @@ class RobotState:
     robot_mode: int           # 7 == RUNNING
     safety_status: int        # 1 == NORMAL
     digital_out: int          # standard digital output bits (bit n == DO n)
+    digital_in: int           # digital input bits (bit n == DI n)
+    analog_in: list[float]    # standard analog input values [AI0, AI1]
 
     @property
     def is_moving(self) -> bool:
@@ -115,8 +118,15 @@ class URClient:
         mode = struct.unpack(">i", body[off:off + 4])[0]; off += 4
         safety = struct.unpack(">i", body[off:off + 4])[0]; off += 4
         dout = struct.unpack(">Q", body[off:off + 8])[0]
+        off += 8
+        din = struct.unpack(">Q", body[off:off + 8])[0]
+        off += 8
+        ain0 = struct.unpack(">d", body[off:off + 8])[0]
+        off += 8
+        ain1 = struct.unpack(">d", body[off:off + 8])[0]
         return RobotState(q_rad=q, qd_rad=qd, tcp_pose=tcp, robot_mode=mode,
-                          safety_status=safety, digital_out=dout)
+                  safety_status=safety, digital_out=dout,
+                  digital_in=din, analog_in=[ain0, ain1])
 
     def get_joint_positions(self) -> list[float]:
         """Actual joint angles in radians, base..wrist3."""
@@ -317,6 +327,79 @@ class URClient:
             done=lambda st: bool(st.digital_out >> pin & 1) == bool(value),
             timeout_s=timeout_s,
         )
+
+    def run_script(self, body: str, *, timeout_s: float = 5.0,
+                   require_running: bool = True) -> RobotState:
+        """Run a one-shot URScript body and wait for completion."""
+        if require_running:
+            self._require_running()
+        return self._run_program(body, done=lambda _st: True, timeout_s=timeout_s)
+
+    @staticmethod
+    def _digital_bit(bits: int, pin: int) -> bool:
+        if not 0 <= pin <= 17:
+            raise ValueError(f"Digital pin must be between 0 and 17, got {pin}.")
+        return bool(bits >> pin & 1)
+
+    def get_digital_in(self, pin: int) -> bool:
+        """Read digital input bit ``pin`` (0..17)."""
+        state = self.get_state()
+        return self._digital_bit(state.digital_in, pin)
+
+    def get_digital_out(self, pin: int) -> bool:
+        """Read digital output bit ``pin`` (0..17)."""
+        state = self.get_state()
+        return self._digital_bit(state.digital_out, pin)
+
+    def get_tool_digital_in(self, pin: int) -> bool:
+        """Read tool digital input bit ``pin`` (0..1)."""
+        if pin not in (0, 1):
+            raise ValueError(f"Tool digital input pin must be 0 or 1, got {pin}.")
+        return self.get_digital_in(16 + pin)
+
+    def get_tool_digital_out(self, pin: int) -> bool:
+        """Read tool digital output bit ``pin`` (0..1)."""
+        if pin not in (0, 1):
+            raise ValueError(f"Tool digital output pin must be 0 or 1, got {pin}.")
+        return self.get_digital_out(16 + pin)
+
+    def set_tool_digital_out(self, pin: int, value: bool,
+                             *, timeout_s: float = 5.0) -> RobotState:
+        """Set tool digital output ``pin`` (0..1) and wait for confirmation."""
+        if pin not in (0, 1):
+            raise ValueError(f"Tool digital output pin must be 0 or 1, got {pin}.")
+        self._require_running()
+        body = f"  set_tool_digital_out({pin}, {'True' if value else 'False'})\n"
+        return self._run_program(
+            body,
+            done=lambda st: self._digital_bit(st.digital_out, 16 + pin) == bool(value),
+            timeout_s=timeout_s,
+        )
+
+    def get_analog_in(self, channel: int) -> float:
+        """Read standard analog input channel 0 or 1."""
+        if channel not in (0, 1):
+            raise ValueError(f"Analog input channel must be 0 or 1, got {channel}.")
+        return float(self.get_state().analog_in[channel])
+
+    def set_analog_out(self, channel: int, value: float,
+                       *, timeout_s: float = 5.0) -> RobotState:
+        """Set standard analog output channel 0 or 1 to a normalized value."""
+        if channel not in (0, 1):
+            raise ValueError(f"Analog output channel must be 0 or 1, got {channel}.")
+        if not 0.0 <= value <= 1.0:
+            raise ValueError(
+                f"Analog output value must be in [0.0, 1.0], got {value}."
+            )
+        body = f"  set_standard_analog_out({channel}, {value:.6f})\n"
+        return self.run_script(body, timeout_s=timeout_s)
+
+    def set_tool_voltage(self, voltage: int, *, timeout_s: float = 5.0) -> RobotState:
+        """Set tool voltage to 0, 12, or 24 V."""
+        if voltage not in (0, 12, 24):
+            raise ValueError(f"Tool voltage must be one of 0, 12, 24 V, got {voltage}.")
+        body = f"  set_tool_voltage({voltage})\n"
+        return self.run_script(body, timeout_s=timeout_s)
 
     # --- RTDE framing helpers ------------------------------------------- #
     @staticmethod

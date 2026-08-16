@@ -30,7 +30,7 @@ logging.disable(logging.CRITICAL)
 
 HOME_DEG = [0, -90, 0, -90, 0, 0]
 
-ALL_TOOLS = {
+REQUIRED_TOOLS = {
     "move_robot_to_position", "get_robot_state", "move_joints_relative",
     "move_linear", "run_trajectory", "set_gripper", "example",
 }
@@ -54,7 +54,7 @@ async def expect_rejection(client, tool: str, args: dict, label: str,
 async def main() -> None:
     async with Client(mcp) as client:
         names = [t.name for t in await client.list_tools()]
-        assert set(names) == ALL_TOOLS, names
+        assert REQUIRED_TOOLS.issubset(set(names)), names
         print("tools:", sorted(names))
 
         result = await client.call_tool("example", {})

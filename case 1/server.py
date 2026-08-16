@@ -17,10 +17,18 @@ This file ships TWO tools:
     to start a new tool of your own.
 
 Return JSON-serializable dicts with explicit units in the key names.
+
+Prompting guidance for MCP clients (important for reliable tool use):
+    * If a user asks to "save/store a position" but does not specify whether they
+        mean Cartesian TCP pose or joint configuration, ASK a clarification question
+        before calling a storage or motion tool.
+    * Use TCP/cartesian language with pose variables (p[x,y,z,rx,ry,rz]); use
+        joint/configuration language with six joint angles.
 """
 from __future__ import annotations
 
 import math
+import re
 import time
 
 from fastmcp import FastMCP
@@ -97,6 +105,22 @@ _DH_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
 
 # Which frame origin sits where on the arm, for readable error messages.
 _FRAME_NAMES = ("shoulder", "elbow", "wrist1", "wrist2", "wrist3", "tool")
+
+
+def _validate_ur_variable_name(name: str) -> str:
+    """Return a safe URScript variable name or raise ValueError.
+
+    URScript identifiers: letters/underscore first, then letters/digits/underscore.
+    """
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("variable_name must be a non-empty string.")
+    candidate = name.strip()
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", candidate):
+        raise ValueError(
+            "Invalid variable_name. Use only letters, digits, and underscore, "
+            "and do not start with a digit."
+        )
+    return candidate
 
 
 def _fk_points(q_rad: list[float]) -> list[tuple[float, float, float]]:
@@ -692,6 +716,581 @@ def set_gripper(closed: bool) -> dict:
         "pin": GRIPPER_PIN,
         "pin_state": confirmed,
     }
+
+
+# =========================================================================== #
+# COMMISSIONING TOOLS  --  setup, IO checks, sensor prep, and manual guidance.
+# These wrap common URScript commissioning calls as MCP tools.
+# =========================================================================== #
+@mcp.tool
+def set_tcp(tcp_pose_m_rad: list[float]) -> dict:
+    """Set the active Tool Center Point using a URScript TCP pose.
+
+    Args:
+        tcp_pose_m_rad: TCP pose [x, y, z, rx, ry, rz] in metres/radians.
+
+    Returns:
+        A dict confirming the TCP that was applied.
+    """
+    if len(tcp_pose_m_rad) != 6:
+        raise ValueError(
+            f"Expected tcp_pose_m_rad with 6 values [x,y,z,rx,ry,rz], "
+            f"got {len(tcp_pose_m_rad)}."
+        )
+    tcp = [float(v) for v in tcp_pose_m_rad]
+    body = "  set_tcp(p[" + ", ".join(f"{v:.6f}" for v in tcp) + "])\n"
+    robot.run_script(body)
+    return {
+        "status": "applied",
+        "tcp_pose_m_rad": [round(v, 6) for v in tcp],
+    }
+
+
+@mcp.tool
+def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
+    """Set payload mass and center-of-gravity for commissioning checks.
+
+    Args:
+        mass_kg: Payload mass in kilograms.
+        cog_m: Center of gravity [x, y, z] in metres relative to the tool.
+            Defaults to [0, 0, 0].
+    """
+    if mass_kg < 0:
+        raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
+    cog = [0.0, 0.0, 0.0] if cog_m is None else [float(v) for v in cog_m]
+    if len(cog) != 3:
+        raise ValueError(f"Expected cog_m as [x, y, z], got {len(cog)} values.")
+    body = (
+        f"  set_payload({float(mass_kg):.6f}, "
+        f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
+    )
+    robot.run_script(body)
+    return {
+        "status": "applied",
+        "mass_kg": round(float(mass_kg), 6),
+        "cog_m": [round(v, 6) for v in cog],
+    }
+
+
+@mcp.tool
+def set_payload_mass(mass_kg: float) -> dict:
+    """Set payload mass only (CoG unchanged by controller defaults)."""
+    if mass_kg < 0:
+        raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
+    body = f"  set_payload_mass({float(mass_kg):.6f})\n"
+    robot.run_script(body)
+    return {
+        "status": "applied",
+        "mass_kg": round(float(mass_kg), 6),
+    }
+
+
+@mcp.tool
+def set_gravity(gravity_m_s2: list[float]) -> dict:
+    """Set gravity vector [gx, gy, gz] for non-floor robot mounting.
+
+    Typical floor-mounted value is [0, 0, -9.82].
+    """
+    if len(gravity_m_s2) != 3:
+        raise ValueError(
+            f"Expected gravity_m_s2 as [gx, gy, gz], got {len(gravity_m_s2)} values."
+        )
+    g = [float(v) for v in gravity_m_s2]
+    magnitude = math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2])
+    if not 7.0 <= magnitude <= 12.0:
+        raise ValueError(
+            f"Gravity magnitude {magnitude:.3f} m/s^2 looks invalid; expected "
+            "roughly Earth's gravity (about 9.82 m/s^2)."
+        )
+    body = f"  set_gravity([{g[0]:.6f}, {g[1]:.6f}, {g[2]:.6f}])\n"
+    robot.run_script(body)
+    return {
+        "status": "applied",
+        "gravity_m_s2": [round(v, 6) for v in g],
+        "magnitude_m_s2": round(magnitude, 6),
+    }
+
+
+@mcp.tool
+def is_within_safety_limits(
+    pose_m_rad: list[float] | None = None,
+    qnear_deg: list[float] | None = None,
+) -> dict:
+    """Check whether a candidate pose/joint target passes server safety checks.
+
+    This mirrors commissioning intent of URScript's is_within_safety_limits,
+    but evaluates against this server's configured safety layer.
+
+    Args:
+        pose_m_rad: Optional candidate [x, y, z, rx, ry, rz].
+        qnear_deg: Optional candidate joints [base..wrist3] in degrees.
+
+    Returns:
+        A dict with `within_limits` and a plain-language `reason`.
+    """
+    if pose_m_rad is None and qnear_deg is None:
+        raise ValueError("Provide at least one of pose_m_rad or qnear_deg.")
+    if pose_m_rad is not None and len(pose_m_rad) != 6:
+        raise ValueError(f"Expected pose_m_rad with 6 values, got {len(pose_m_rad)}.")
+
+    try:
+        if qnear_deg is not None:
+            target = _checked_joint_target([float(v) for v in qnear_deg])
+            _check_pose_safe(target, what="the joint target")
+
+        if pose_m_rad is not None:
+            pose = [float(v) for v in pose_m_rad]
+            _check_box(*pose[:3], what="the Cartesian target")
+            _check_reach(*pose[:3], what="the Cartesian target")
+            _check_flange_above_table(pose[:3], pose[3:])
+    except ValueError as exc:
+        return {
+            "within_limits": False,
+            "reason": str(exc),
+            "checked_pose": pose_m_rad,
+            "checked_qnear_deg": qnear_deg,
+        }
+
+    return {
+        "within_limits": True,
+        "reason": "Target is within configured server safety checks.",
+        "checked_pose": pose_m_rad,
+        "checked_qnear_deg": qnear_deg,
+    }
+
+
+@mcp.tool
+def get_digital_in(n: int) -> dict:
+    """Read digital input pin n (0..17)."""
+    value = robot.get_digital_in(n)
+    return {"pin": n, "value": value}
+
+
+@mcp.tool
+def set_digital_out(n: int, b: bool) -> dict:
+    """Set digital output pin n (0..17) and confirm readback."""
+    state = robot.set_digital_out(n, b)
+    value = bool(state.digital_out >> n & 1)
+    return {"pin": n, "value": value}
+
+
+@mcp.tool
+def get_tool_digital_in(n: int) -> dict:
+    """Read tool digital input pin n (0..1)."""
+    value = robot.get_tool_digital_in(n)
+    return {"pin": n, "value": value}
+
+
+@mcp.tool
+def set_tool_digital_out(n: int, b: bool) -> dict:
+    """Set tool digital output pin n (0..1) and confirm readback."""
+    state = robot.set_tool_digital_out(n, b)
+    value = bool(state.digital_out >> (16 + n) & 1)
+    return {"pin": n, "value": value}
+
+
+@mcp.tool
+def set_tool_voltage(voltage: int) -> dict:
+    """Set tool connector voltage to 0 V, 12 V, or 24 V."""
+    robot.set_tool_voltage(voltage)
+    return {"status": "applied", "voltage_v": voltage}
+
+
+@mcp.tool
+def get_analog_in(n: int) -> dict:
+    """Read analog input channel n (0 or 1)."""
+    value = robot.get_analog_in(n)
+    return {"channel": n, "value": round(value, 6)}
+
+
+@mcp.tool
+def set_analog_out(n: int, f: float) -> dict:
+    """Set analog output channel n (0 or 1) to normalized value f in [0,1]."""
+    robot.set_analog_out(n, f)
+    return {"status": "applied", "channel": n, "value": round(float(f), 6)}
+
+
+@mcp.tool
+def zero_ftsensor() -> dict:
+    """Zero the internal force/torque sensor bias (e-Series)."""
+    robot.run_script("  zero_ftsensor()\n")
+    return {"status": "applied"}
+
+
+@mcp.tool
+def enable_external_ft_sensor(
+    enable: bool = True,
+    sensor_mass_kg: float = 0.0,
+    sensor_measuring_offset_m: list[float] | None = None,
+    sensor_cog_m: list[float] | None = None,
+) -> dict:
+    """Configure an external wrist-mounted force/torque sensor.
+
+    Args mirror URScript enable_external_ft_sensor(...).
+    """
+    if sensor_mass_kg < 0:
+        raise ValueError(
+            f"sensor_mass_kg must be non-negative, got {sensor_mass_kg}."
+        )
+    offset = ([0.0, 0.0, 0.0] if sensor_measuring_offset_m is None
+              else [float(v) for v in sensor_measuring_offset_m])
+    cog = [0.0, 0.0, 0.0] if sensor_cog_m is None else [float(v) for v in sensor_cog_m]
+    if len(offset) != 3:
+        raise ValueError(
+            f"Expected sensor_measuring_offset_m as [x, y, z], got {len(offset)} values."
+        )
+    if len(cog) != 3:
+        raise ValueError(
+            f"Expected sensor_cog_m as [x, y, z], got {len(cog)} values."
+        )
+    body = (
+        "  enable_external_ft_sensor("
+        f"{'True' if enable else 'False'}, {float(sensor_mass_kg):.6f}, "
+        f"[{offset[0]:.6f}, {offset[1]:.6f}, {offset[2]:.6f}], "
+        f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
+    )
+    robot.run_script(body)
+    return {
+        "status": "applied",
+        "enabled": bool(enable),
+        "sensor_mass_kg": round(float(sensor_mass_kg), 6),
+        "sensor_measuring_offset_m": [round(v, 6) for v in offset],
+        "sensor_cog_m": [round(v, 6) for v in cog],
+    }
+
+
+@mcp.tool
+def tool_contact(direction: list[float]) -> dict:
+    """Call URScript tool_contact(direction) as a commissioning probe.
+
+    Note: this triggers the controller-side contact check and confirms only
+    that the script executed successfully.
+    """
+    if len(direction) != 3:
+        raise ValueError(
+            f"Expected direction as [dx, dy, dz], got {len(direction)} values."
+        )
+    d = [float(v) for v in direction]
+    if math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) < 1e-9:
+        raise ValueError("Direction vector must be non-zero.")
+    body = f"  tool_contact([{d[0]:.6f}, {d[1]:.6f}, {d[2]:.6f}])\n"
+    robot.run_script(body, timeout_s=10.0)
+    return {
+        "status": "executed",
+        "direction": [round(v, 6) for v in d],
+    }
+
+
+@mcp.tool
+def freedrive_mode(duration_s: float = 10.0) -> dict:
+    """Enable freedrive for manual guiding, then automatically exit.
+
+    Args:
+        duration_s: Freedrive hold time in seconds (0.5 to 120).
+    """
+    if not 0.5 <= duration_s <= 120.0:
+        raise ValueError(
+            f"duration_s must be in [0.5, 120.0], got {duration_s}."
+        )
+    body = (
+        "  freedrive_mode()\n"
+        f"  sleep({float(duration_s):.3f})\n"
+        "  end_freedrive_mode()\n"
+    )
+    state = robot.run_script(body, timeout_s=max(10.0, float(duration_s) + 5.0))
+    return {
+        "status": "completed",
+        "duration_s": round(float(duration_s), 3),
+        "joints_deg": {n: round(math.degrees(q), 2)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+    }
+
+
+@mcp.tool
+def get_actual_tcp_pose() -> dict:
+    """Read current TCP pose [x, y, z, rx, ry, rz] in metres/radians."""
+    pose = robot.get_tcp_pose()
+    return {"tcp_pose_m_rad": [round(v, 6) for v in pose]}
+
+
+@mcp.tool
+def get_actual_joint_positions() -> dict:
+    """Read current joint positions in radians and degrees."""
+    q_rad = robot.get_joint_positions()
+    return {
+        "joints_rad": {n: round(v, 6) for n, v in zip(JOINT_NAMES, q_rad)},
+        "joints_deg": {n: round(math.degrees(v), 3) for n, v in zip(JOINT_NAMES, q_rad)},
+    }
+
+
+@mcp.tool
+def store_pose_on_ur(
+    variable_name: str,
+    pose_type: str = "tcp",
+    tcp_pose_m_rad: list[float] | None = None,
+    joint_angles_deg: list[float] | None = None,
+) -> dict:
+    """Deprecated compatibility wrapper for UR-side pose/joint storage.
+
+    Prefer the explicit tools instead:
+      - ``store_waypoint_pose_on_ur`` for waypoint-compatible TCP pose variables
+      - ``store_joint_configuration_on_ur`` for joint configuration variables
+
+    This wrapper remains for compatibility and forwards to one of those
+    explicit storage modes.
+
+    Args:
+        variable_name: Target UR variable name (e.g. "pick_pose").
+        pose_type: "tcp" to store a pose vector p[x,y,z,rx,ry,rz], or "joints"
+            to store six joint angles in radians [q0..q5].
+        tcp_pose_m_rad: Optional explicit TCP pose. If omitted and pose_type is
+            "tcp", the current actual TCP pose is stored.
+        joint_angles_deg: Optional explicit joint target in degrees. If omitted
+            and pose_type is "joints", current actual joints are stored.
+
+    Returns:
+        A dict describing what was written.
+
+    Model behavior requirement:
+        If the user's request is ambiguous (for example "save this position"
+        without saying TCP/cartesian vs joints/configuration), ask a
+        clarification question first and do not call this tool until one is
+        specified.
+
+    Notes:
+        For persistence across robot restarts, create the same variable as an
+        Installation variable in PolyScope and use this tool to update it.
+    """
+    name = _validate_ur_variable_name(variable_name)
+    kind = str(pose_type).strip().lower()
+    if kind not in ("tcp", "joints"):
+        raise ValueError("pose_type must be either 'tcp' or 'joints'.")
+
+    if kind == "tcp":
+        out = store_waypoint_pose_on_ur(
+            variable_name=name,
+            tcp_pose_m_rad=tcp_pose_m_rad,
+        )
+        out["deprecated_tool"] = "store_pose_on_ur"
+        return out
+
+    out = store_joint_configuration_on_ur(
+        variable_name=name,
+        joint_angles_deg=joint_angles_deg,
+    )
+    out["deprecated_tool"] = "store_pose_on_ur"
+    return out
+
+
+@mcp.tool
+def store_waypoint_pose_on_ur(
+    variable_name: str,
+    tcp_pose_m_rad: list[float] | None = None,
+) -> dict:
+    """Store a waypoint-compatible TCP pose variable on the UR controller.
+
+    Use this when the stored value should later be consumed by a PolyScope
+    Variable Waypoint. The variable will be written as a UR pose value:
+    p[x, y, z, rx, ry, rz].
+
+    Args:
+        variable_name: Target UR variable name (e.g. "pick_tcp").
+        tcp_pose_m_rad: Optional explicit pose [x,y,z,rx,ry,rz] in m/rad.
+            If omitted, stores the current actual TCP pose.
+
+    Returns:
+        A dict with storage details and waypoint compatibility flags.
+
+    Notes:
+        To keep the value available across restarts and visible in PolyScope,
+        create the same name as an Installation variable and use that variable
+        in a Variable Waypoint node.
+    """
+    name = _validate_ur_variable_name(variable_name)
+    if tcp_pose_m_rad is None:
+        values = [float(v) for v in robot.get_tcp_pose()]
+    else:
+        if len(tcp_pose_m_rad) != 6:
+            raise ValueError(
+                f"Expected tcp_pose_m_rad with 6 values [x,y,z,rx,ry,rz], "
+                f"got {len(tcp_pose_m_rad)}."
+            )
+        values = [float(v) for v in tcp_pose_m_rad]
+    body = (
+        f"  global {name} = p[{values[0]:.6f}, {values[1]:.6f}, {values[2]:.6f}, "
+        f"{values[3]:.6f}, {values[4]:.6f}, {values[5]:.6f}]\n"
+    )
+    robot.run_script(body)
+    return {
+        "status": "stored_on_ur",
+        "tool": "store_waypoint_pose_on_ur",
+        "variable_name": name,
+        "pose_type": "tcp",
+        "value_m_rad": [round(v, 6) for v in values],
+        "storage": "ur_controller_variable",
+        "waypoint_compatible": True,
+        "recommended_program_use": "PolyScope Variable Waypoint",
+    }
+
+
+@mcp.tool
+def store_joint_configuration_on_ur(
+    variable_name: str,
+    joint_angles_deg: list[float] | None = None,
+) -> dict:
+    """Store a joint configuration variable on the UR controller.
+
+    Use this when you want to save a robot configuration as six joint values,
+    then later move to it with ``move_to_stored_joint_configuration``.
+
+    Args:
+        variable_name: Target UR variable name (for example ``home_q``).
+        joint_angles_deg: Optional explicit joint target in degrees. If omitted,
+            stores the current actual joints.
+
+    Returns:
+        A dict with the stored joint configuration.
+    """
+    name = _validate_ur_variable_name(variable_name)
+    if joint_angles_deg is None:
+        q_rad = [float(v) for v in robot.get_joint_positions()]
+    else:
+        q_rad = _checked_joint_target([float(v) for v in joint_angles_deg])
+    body = (
+        f"  global {name} = [{q_rad[0]:.6f}, {q_rad[1]:.6f}, {q_rad[2]:.6f}, "
+        f"{q_rad[3]:.6f}, {q_rad[4]:.6f}, {q_rad[5]:.6f}]\n"
+    )
+    robot.run_script(body)
+    return {
+        "status": "stored_on_ur",
+        "tool": "store_joint_configuration_on_ur",
+        "variable_name": name,
+        "pose_type": "joints",
+        "value_rad": [round(v, 6) for v in q_rad],
+        "value_deg": [round(math.degrees(v), 3) for v in q_rad],
+        "storage": "ur_controller_variable",
+        "waypoint_compatible": False,
+        "recommended_program_use": "Joint configuration/reference data",
+    }
+
+
+@mcp.tool
+def move_to_stored_tcp_waypoint(
+    variable_name: str,
+    speed: float = 0.25,
+    acceleration: float = 1.2,
+    timeout_s: float = 30.0,
+) -> dict:
+    """Move linearly to a UR-side pose variable (no local memory lookup).
+
+    This executes `movel(<variable_name>, ...)` on the controller, so the target
+    is resolved from the UR variable directly. Use this with variables created by
+    `store_waypoint_pose_on_ur` (pose values like p[x,y,z,rx,ry,rz]).
+
+    Args:
+        variable_name: Name of a UR pose variable present on the controller.
+        speed: Cartesian speed in m/s.
+        acceleration: Cartesian acceleration in m/s^2.
+        timeout_s: Completion timeout in seconds.
+
+    Returns:
+        Final robot state snapshot after the move.
+    """
+    name = _validate_ur_variable_name(variable_name)
+    _check_tcp_dynamics(speed, acceleration)
+    if timeout_s <= 0:
+        raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+    # The target comes from a UR-side variable: no Python-side pose cache.
+    body = (
+        f"  movel({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+    )
+    state = robot.run_script(body, timeout_s=float(timeout_s))
+    return {
+        "status": "executed",
+        "source": "ur_controller_variable",
+        "variable_name": name,
+        "motion": "movel",
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "robot_mode": state.robot_mode,
+    }
+
+
+@mcp.tool
+def move_to_stored_joint_configuration(
+    variable_name: str,
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+    timeout_s: float = 30.0,
+) -> dict:
+    """Move in joint space to a UR-side joint variable (no local memory lookup).
+
+    This executes `movej(<variable_name>, ...)` on the controller, so the target
+    is resolved from the UR variable directly. Use this with variables created by
+    `store_joint_configuration_on_ur`.
+
+    Args:
+        variable_name: Name of a UR joint variable present on the controller.
+        speed: Joint speed in rad/s.
+        acceleration: Joint acceleration in rad/s^2.
+        timeout_s: Completion timeout in seconds.
+
+    Returns:
+        Final robot state snapshot after the move.
+    """
+    name = _validate_ur_variable_name(variable_name)
+    _check_joint_dynamics(speed, acceleration)
+    if timeout_s <= 0:
+        raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+    # The target comes from a UR-side variable: no Python-side joint cache.
+    body = (
+        f"  movej({name}, a={float(acceleration):.4f}, v={float(speed):.4f})\n"
+    )
+    state = robot.run_script(body, timeout_s=float(timeout_s))
+    return {
+        "status": "executed",
+        "source": "ur_controller_variable",
+        "variable_name": name,
+        "motion": "movej",
+        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_deg": {n: round(math.degrees(q), 1)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "robot_mode": state.robot_mode,
+    }
+
+
+@mcp.tool
+def movej(
+    joint_angles_deg: list[float],
+    speed: float = DEFAULT_SPEED,
+    acceleration: float = DEFAULT_ACCEL,
+) -> dict:
+    """URScript-style alias for move_robot_to_position (absolute joint move)."""
+    return move_robot_to_position(
+        joint_angles_deg=joint_angles_deg,
+        speed=speed,
+        acceleration=acceleration,
+    )
+
+
+@mcp.tool
+def movel(
+    position_m: list[float],
+    rotation_rad: list[float] | None = None,
+    speed: float = 0.25,
+    acceleration: float = 1.2,
+) -> dict:
+    """URScript-style alias for move_linear (Cartesian straight-line move)."""
+    return move_linear(
+        position_m=position_m,
+        rotation_rad=rotation_rad,
+        speed=speed,
+        acceleration=acceleration,
+    )
 
 
 # =========================================================================== #
