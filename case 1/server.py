@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import threading
 import time
@@ -78,6 +79,8 @@ GRIPPER_PIN = 0
 
 # =========================================================================== #
 # DIAMOND SAFETY LAYER  --  every motion tool funnels through these checks
+# (geometry comes from the UR_MODEL table below; the ur10e row is verified
+# to match the simulator's TCP to the millimetre)
 # BEFORE anything moves. A forward-kinematics model (UR10e DH parameters,
 # verified to match the simulator's TCP to the millimetre) predicts where a
 # joint target puts the whole arm, so unsafe commands are rejected with a
@@ -86,26 +89,65 @@ GRIPPER_PIN = 0
 
 # Command caps. Joint units rad/s, rad/s^2 (UR10e's slowest joints allow
 # 2.09 rad/s); TCP units m/s, m/s^2.
-MAX_JOINT_SPEED = 2.0
-MAX_JOINT_ACCEL = 4.0
-MAX_TCP_SPEED = 1.0
-MAX_TCP_ACCEL = 2.5
+# Dynamics caps. Overridable per cell (e.g. gentler for a real arm around
+# people) without touching code: UR_MAX_JOINT_SPEED etc.
+MAX_JOINT_SPEED = float(os.environ.get("UR_MAX_JOINT_SPEED", "2.0"))
+MAX_JOINT_ACCEL = float(os.environ.get("UR_MAX_JOINT_ACCEL", "4.0"))
+MAX_TCP_SPEED = float(os.environ.get("UR_MAX_TCP_SPEED", "1.0"))
+MAX_TCP_ACCEL = float(os.environ.get("UR_MAX_TCP_ACCEL", "2.5"))
+
+# The safety layer computes forward kinematics, reach, and workspace bounds
+# from the robot's geometry, so it must know WHICH arm it is guarding.
+# UR_MODEL selects a row; the default matches the PolyScope X simulator
+# (a UR10e). Set UR_MODEL=ur5e (or ur5) when driving the real arm.
+# DH values (a, d) are UR's published standard-DH tables; reach_m is the
+# kinematic maximum from the shoulder point, wrist offsets included;
+# workspace_m boxes the tool tip in the base frame.
+_UR_MODELS = {
+    "ur10e": {
+        "dh_a": (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0),
+        "dh_d": (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655),
+        "reach_m": 1.37,
+        "payload_kg": 12.5,
+        "workspace_m": {"x": (-1.30, 1.30), "y": (-1.30, 1.30),
+                        "z": (0.02, 1.60)},
+    },
+    "ur5e": {
+        "dh_a": (0.0, -0.425, -0.3922, 0.0, 0.0, 0.0),
+        "dh_d": (0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996),
+        "reach_m": 0.95,
+        "payload_kg": 5.0,
+        "workspace_m": {"x": (-0.95, 0.95), "y": (-0.95, 0.95),
+                        "z": (0.02, 1.20)},
+    },
+    "ur5": {  # CB-series UR5
+        "dh_a": (0.0, -0.425, -0.39225, 0.0, 0.0, 0.0),
+        "dh_d": (0.089159, 0.0, 0.0, 0.10915, 0.09465, 0.0823),
+        "reach_m": 0.92,
+        "payload_kg": 5.0,
+        "workspace_m": {"x": (-0.92, 0.92), "y": (-0.92, 0.92),
+                        "z": (0.02, 1.05)},
+    },
+}
+UR_MODEL = os.environ.get("UR_MODEL", "ur10e").strip().lower()
+if UR_MODEL not in _UR_MODELS:
+    raise SystemExit(
+        f"Unknown UR_MODEL '{UR_MODEL}'; pick one of {sorted(_UR_MODELS)}")
+_MODEL = _UR_MODELS[UR_MODEL]
 
 # Safe workspace for the tool, base frame, metres. The tool tip may work down
 # to FLOOR_Z_M; the arm's joint origins (thick links, ~5 cm radius) must keep
 # the larger ARM_CLEARANCE_M so the physical link never touches the table even
 # though the check runs on the centreline.
-WORKSPACE_M = {"x": (-1.30, 1.30), "y": (-1.30, 1.30), "z": (0.02, 1.60)}
+WORKSPACE_M = _MODEL["workspace_m"]
 FLOOR_Z_M = 0.02
 ARM_CLEARANCE_M = 0.08
-# Kinematic maximum distance from the shoulder point (~1.364 m, wrist offsets
-# included). A Cartesian target beyond this can never be reached and would
-# only make movel stall until timeout.
-REACH_M = 1.37
+# A Cartesian target beyond this can never be reached and would only make
+# movel stall until timeout.
+REACH_M = _MODEL["reach_m"]
 
-# UR10e standard DH parameters (a, d, alpha), from UR's published table.
-_DH_A = (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0)
-_DH_D = (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655)
+_DH_A = _MODEL["dh_a"]
+_DH_D = _MODEL["dh_d"]
 _DH_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
 
 # Which frame origin sits where on the arm, for readable error messages.
@@ -115,7 +157,13 @@ _FRAME_NAMES = ("shoulder", "elbow", "wrist1", "wrist2", "wrist3", "tool")
 _TRAJECTORY_JOBS_LOCK = threading.Lock()
 _TRAJECTORY_JOBS: dict[str, "TrajectoryJob"] = {}
 _MAX_STORED_PROGRESS_SAMPLES = 500
-_WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name("waypoints_lookup_table.json")
+# Stored poses are only meaningful for the arm they were taught on, so every
+# non-simulator model gets its own bank file; the legacy unsuffixed file
+# belongs to the ur10e simulator it was recorded on.
+_WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name(
+    "waypoints_lookup_table.json"
+    if os.environ.get("UR_MODEL", "ur10e").strip().lower() == "ur10e"
+    else f"waypoints_lookup_table.{os.environ.get('UR_MODEL').strip().lower()}.json")
 _WAYPOINT_BANK_LOCK = threading.Lock()
 
 
@@ -510,7 +558,7 @@ def _check_flange_above_table(position: list[float],
     """Reject a TCP pose whose ORIENTATION puts the wrist under the table.
 
     The box check sees only the tool point; with the tool z-axis pointing up,
-    the wrist flange sits d6 = 0.117 m BELOW the TCP and can pass through the
+    the wrist flange sits d6 (the active model's wrist offset, _DH_D[5]) BELOW the TCP and can pass through the
     table while the TCP itself stays legal. The flange point needs no inverse
     kinematics: it is TCP - d6 * (tool z-axis in base frame).
     """
@@ -729,7 +777,8 @@ def move_linear(
     Use this when the path matters, not just the destination: approaching,
     inserting, drawing -- the tool tip travels a straight line in space
     (a joint move would sweep an arc). Position is [x, y, z] in metres in the
-    robot's base frame; for scale, home is [0, -0.29, 1.48].
+    robot's base frame; for scale, the upright HOME pose puts the tool at
+    z = 1.48 m on the UR10e simulator and z = 1.08 m on a UR5e.
 
     Caution: linear motion is impossible from a singular configuration and
     such calls are rejected up front -- if the arm is fully stretched (elbow
@@ -1006,7 +1055,7 @@ def set_tcp(tcp_pose_m_rad: list[float]) -> dict:
     }
 
 
-# Mass and cog is limited for UR10e 
+# Mass and CoG are limited by the selected UR_MODEL's rated payload.
 @mcp.tool
 def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
     """Set payload mass and center-of-gravity for commissioning checks.
@@ -1018,21 +1067,26 @@ def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
     Returns:
         A dict confirming the payload mass and CoG that was applied.
     Raises:
-        ValueError: Negative mass, mass above 12.5 kg, or malformed CoG.
-        CoG Error: If the mass and CoG offset exceed the UR10e's payload limit.
-        
+        ValueError: Negative mass, mass above the selected model's rated
+            payload, malformed CoG, or a mass/CoG-offset combination beyond
+            the model's rating.
     """
+    limit = _MODEL["payload_kg"]
     if mass_kg < 0:
         raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
-    if mass_kg > 12.5:
-        raise ValueError(f"Payload mass of UR10 must be lower than 12.5kg, got  {mass_kg} kg.")
+    if mass_kg > limit:
+        raise ValueError(
+            f"Payload mass on a {UR_MODEL} must be at most {limit} kg, "
+            f"got {mass_kg} kg.")
     cog = [0.0, 0.0, 0.0] if cog_m is None else [float(v) for v in cog_m]
     if len(cog) != 3:
         raise ValueError(f"Expected cog_m as [x, y, z], got {len(cog)} values.")
     offset_distance = math.hypot(*cog)
     print(f"Payload mass: {mass_kg} kg, CoG offset distance: {offset_distance:.3f} m")
-    if (mass_kg * offset_distance) > 12.5:
-        raise ValueError(f"Invalid CoG. {mass_kg} kg cannot be offset by {offset_distance:.3f} m.")
+    if (mass_kg * offset_distance) > limit:
+        raise ValueError(
+            f"Invalid CoG for a {UR_MODEL}: {mass_kg} kg cannot be offset "
+            f"by {offset_distance:.3f} m.")
     body = (
         f"  set_payload({float(mass_kg):.6f}, "
         f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
@@ -1050,6 +1104,10 @@ def set_payload_mass(mass_kg: float) -> dict:
     """Set payload mass only (CoG unchanged by controller defaults)."""
     if mass_kg < 0:
         raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
+    if mass_kg > _MODEL["payload_kg"]:
+        raise ValueError(
+            f"Payload mass on a {UR_MODEL} must be at most "
+            f"{_MODEL['payload_kg']} kg, got {mass_kg} kg.")
     body = f"  set_payload_mass({float(mass_kg):.6f})\n"
     robot.run_script(body)
     return {
@@ -1272,6 +1330,8 @@ def store_waypoint_pose_on_ur(
                 f"got {len(tcp_pose_m_rad)}."
             )
         values = [float(v) for v in tcp_pose_m_rad]
+        _check_reach(*values[:3], what="the pose being stored")
+        _check_flange_above_table(values[:3], values[3:])
     robot.define_pose_variable(name, values)
     _save_pose_to_waypoint_bank(name, values)
     return {
@@ -1357,6 +1417,32 @@ def move_to_stored_tcp_waypoint(
     _check_tcp_dynamics(speed, acceleration)
     if timeout_s <= 0:
         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+    # The controller resolves the variable, but the move must still pass the
+    # same geometric gate as move_linear -- a stored pose taught on a bigger
+    # arm (or another cell) would otherwise replay unchecked. The pose is
+    # looked up locally: first the waypoint bank, then the cached expression.
+    pose = None
+    bank = _load_waypoint_bank()
+    entry = bank.get("pose_variables", {}).get(name)
+    if isinstance(entry, list) and len(entry) == 6:
+        pose = [float(v) for v in entry]
+    elif isinstance(entry, dict) and isinstance(entry.get("value"), list):
+        pose = [float(v) for v in entry["value"]]
+    if pose is None:
+        expr = robot._cached_ur_variable_expr(name)
+        if expr and expr.startswith("p["):
+            try:
+                pose = [float(v) for v in expr[2:-1].split(",")]
+            except ValueError:
+                pose = None
+    if pose is None or len(pose) != 6:
+        raise ValueError(
+            f"'{name}' is not in the local waypoint bank, so its target "
+            "cannot be safety-checked before moving. Re-store it with "
+            "store_waypoint_pose_on_ur first.")
+    _check_reach(*pose[:3], what=f"stored waypoint '{name}'")
+    _check_flange_above_table(pose[:3], pose[3:])
 
     state = robot.move_linear_to_variable(
         name,

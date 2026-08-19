@@ -1,0 +1,10 @@
+# Case 4, eye-in-hand visual servoing (RealSense D435 + YOLO26).
+ultralytics>=8.4.0    # YOLO26 (end-to-end, NMS-free) -- pulls torch + numpy
+lap>=0.5.12           # needed by the BoT-SORT tracker (model.track)
+opencv-python>=4.9    # video window, overlay, webcam fallback
+
+# RealSense Python bindings. Official wheels cover Linux/Windows only; on
+# macOS (Apple Silicon) the community build pyrealsense2-macosx ships
+# arm64 wheels for Python 3.9-3.14 (import name is still `pyrealsense2`).
+pyrealsense2>=2.55 ; platform_system != "Darwin"
+pyrealsense2-macosx>=2.56 ; platform_system == "Darwin"

@@ -22,6 +22,12 @@ import logging
 
 from fastmcp import Client
 
+import os
+
+# The geometric test targets (reach, singularity probes) are UR10e-scale;
+# pin the model so the suite is independent of the ambient UR_MODEL.
+os.environ.setdefault("UR_MODEL", "ur10e")
+
 from server import mcp, robot
 
 # The validation checks below trigger expected errors; keep the framework from
