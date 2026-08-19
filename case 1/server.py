@@ -940,6 +940,19 @@ def get_trajectory_job_status(
             response["result"] = job.result
     return response
 
+_FREEDRIVE_ACTIVE = False
+
+def _freedrive_worker():
+    global _FREEDRIVE_ACTIVE
+
+    try:
+        # This must stay alive long enough for freedrive to remain active.
+        # If your API supports async execution, prefer that.
+        robot.run_script("  freedrive_mode()\n"
+                         f"  sleep({float(300):.3f})\n"
+                         , timeout_s=300.0)
+    finally:
+        _FREEDRIVE_ACTIVE = False
 
 # =========================================================================== #
 # DIAMOND TOOL  --  gripper via digital IO. The simulator has no physical
@@ -1194,11 +1207,12 @@ def set_analog_out(n: int, f: float) -> dict:
 
 @mcp.tool
 def freedrive_mode(duration_s: float = 10.0) -> dict:
-    """Enable freedrive for manual guiding, then automatically exit.
+    """Enable freedrive for manual guiding, keep it for a specific amount of time then automatically exit.
     Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
         
      Args:   
         duration_s: Freedrive hold time in seconds (0.5 to 120).
+        
     """
     if not 0.5 <= duration_s <= 120.0:
         raise ValueError(
@@ -1217,6 +1231,41 @@ def freedrive_mode(duration_s: float = 10.0) -> dict:
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
         "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
     }
+
+@mcp.tool
+def start_freedrive_mode() -> dict:
+    global _FREEDRIVE_ACTIVE
+    """Start freedrive for manual guiding. It will not stop until an ending command is sent.
+    Remind the user to call stop_freedrive_mode() when finished. 
+    Do not let the user call different commands remind them to stopp freedrive mode first.
+    With Freedrive you can quickly reajust the robot to a new position, go to a new point if you want to teach it.
+    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+    """
+    if _FREEDRIVE_ACTIVE:
+        return {"status": "already_started", "mode": "freedrive"}
+    else:
+        thread = threading.Thread(target=_freedrive_worker, daemon=True)
+        thread.start()
+        _FREEDRIVE_ACTIVE = True
+    return {"status": "started", "mode": "freedrive"}
+
+
+@mcp.tool
+def stop_freedrive_mode() -> dict:
+    global _FREEDRIVE_ACTIVE
+    """Stop freedrive for manual guiding. It will stop the freedrive.
+    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+    """
+    if not _FREEDRIVE_ACTIVE:
+        return {"status": "not_active", "mode": "freedrive"}
+    try:
+        robot.run_script("  end_freedrive_mode()\n", timeout_s=5.0)
+        _FREEDRIVE_ACTIVE = False
+        return {"status": "stopped", "mode": "normal"}
+    except:
+        return {"status": "error", "mode": "freedrive", "message": "Failed to stop freedrive mode."}
+
+
 
 
 @mcp.tool

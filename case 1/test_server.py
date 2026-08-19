@@ -66,6 +66,9 @@ async def main() -> None:
         assert result.data == "this was an example"
         print("example: ok")
 
+
+
+
         # --- Silver: the state reader returns the full snapshot ----------- #
         state = await client.call_tool("get_robot_state", {})
         assert set(state.data["joints_deg"]) == {"base", "shoulder", "elbow",
@@ -268,6 +271,15 @@ async def main() -> None:
             {"position_m": [0.5, -0.4, 0.05], "rotation_rad": [0, 0, 0]},
             "wrist-under-table", must_contain="flange")
 
+        # --- Freedrive mode: start + stop, with a long sleep in between -------- #
+        freedrive = await client.call_tool("start_freedrive_mode", {})
+        print("in free drivemode")
+        
+        assert freedrive.data["status"] == "started"
+        await asyncio.sleep(5.0)
+        stop_freedrive = await client.call_tool("stop_freedrive_mode", {})
+        assert stop_freedrive.data["status"] == "stopped"
+
         # --- Diamond: gripper via digital IO, confirmed over RTDE --------- #
         grip = await client.call_tool("set_gripper", {"closed": True})
         assert grip.data["gripper"] == "closed" and grip.data["pin_state"] is True
@@ -288,6 +300,7 @@ async def main() -> None:
         assert moved, "motion log never shows the intermediate waypoint"
         print("out-and-back trajectory:", loop_traj.data["duration_s"], "s,",
               len(loop_traj.data["motion_log"]), "samples")
+
 
         await client.call_tool("move_robot_to_position", {})  # park home
     print("ALL PASSED")
