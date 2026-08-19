@@ -67,6 +67,8 @@ async def main() -> None:
         print("example: ok")
 
 
+
+
         # --- Silver: the state reader returns the full snapshot ----------- #
         state = await client.call_tool("get_robot_state", {})
         assert set(state.data["joints_deg"]) == {"base", "shoulder", "elbow",
@@ -269,12 +271,10 @@ async def main() -> None:
             {"position_m": [0.5, -0.4, 0.05], "rotation_rad": [0, 0, 0]},
             "wrist-under-table", must_contain="flange")
 
-
-
         # --- Freedrive mode: start + stop, with a long sleep in between -------- #
         freedrive = await client.call_tool("start_freedrive_mode", {})
         print("in free drivemode")
-
+        
         assert freedrive.data["status"] == "started"
         await asyncio.sleep(5.0)
         stop_freedrive = await client.call_tool("stop_freedrive_mode", {})
@@ -306,38 +306,6 @@ async def main() -> None:
     print("ALL PASSED")
 
 
-async def small_test() -> None:
-    # --- Simple waypoint upload + move to one saved point ----------- #
-    async with Client(mcp) as client:
-        names = [t.name for t in await client.list_tools()]
-        assert REQUIRED_TOOLS.issubset(set(names)), names
-        print("tools:", sorted(names))
-
-        result = await client.call_tool("example", {})
-        assert result.data == "this was an example"
-        print("example: ok")
-
-        uploaded = await client.call_tool("upload_waypoint_script", {
-            "filename": "simple_test_points.script",
-            "waypoints": [
-                [0.10, -0.20, 0.30, 0.0, 3.14, 0.0],
-                [0.10, -0.10, 0.30, 0.0, 3.14, 0.0],
-            ],
-        })
-        assert uploaded.data["status"] == "uploaded"
-        assert uploaded.data["waypoints_uploaded"] == 2
-
-        # moved = await client.call_tool("move_linear", {
-        #     "position_m": [0.10, -0.10, 0.30],
-        #     "rotation_rad": [0.0, 3.14, 0.0],
-        #     "speed": 0.15,
-        #     "acceleration": 0.8,
-        # })
-        # assert moved.data["status"] == "reached"
-        #print("simple waypoint upload/move: ok")
-
-
 if __name__ == "__main__":
     robot.connect()  # fails fast if the simulator is down or the robot is off
-    asyncio.run(small_test())
-    #asyncio.run(main())
+    asyncio.run(main())

@@ -40,11 +40,6 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
-try:
-    import paramiko
-except ImportError:  # pragma: no cover - only needed for waypoint upload helper.
-    paramiko = None
-
 from motion_patterns import PatternRunner, max_speed_for_radius
 from ur_client import (
     HOME_Q_RAD,
@@ -1274,77 +1269,6 @@ def stop_freedrive_mode() -> dict:
         return {"status": "error", "mode": "freedrive", "message": "Failed to stop freedrive mode."}
 
 
-
-
-@mcp.tool
-def upload_waypoint_script(
-    filename: str = "my_waypoints.script",
-    robot_ip: str = "192.168.1.100",
-    username: str = "root",
-    password: str = "easybot",
-    waypoints: list[list[float]] | None = None,
-) -> dict:
-    """Upload a tiny URScript waypoint file to the robot's /programs folder.
-
-    If ``robot_ip`` is omitted, we re-use the same host as the main UR client
-    (``UR_HOST`` or the default simulator address, ``127.0.0.1``). This keeps the
-    upload helper aligned with the rest of the code, while still allowing a real
-    robot on the LAN to be targeted explicitly.
-
-    This keeps the points persistent on the controller so they can later be
-    loaded with the Dashboard via ``load <filename>``. It does not send motion
-    commands directly; it writes the script file to the robot over SFTP.
-    """
-    if paramiko is None:
-        raise RuntimeError("The paramiko package is required for waypoint upload. Install it with: pip install paramiko")
-
-    if robot_ip is None:
-        robot_ip = robot.host
-
-    if waypoints is None:
-        waypoints = [
-            [0.10, -0.20, 0.30, 0.0, 3.14, 0.0],
-            [0.10, -0.10, 0.30, 0.0, 3.14, 0.0],
-            [0.10,  0.00, 0.30, 0.0, 3.14, 0.0],
-        ]
-
-    if not waypoints:
-        raise ValueError("waypoints must contain at least one pose.")
-
-    lines = ["def my_waypoints():"]
-    for i, pose in enumerate(waypoints, start=1):
-        if len(pose) != 6:
-            raise ValueError(
-                f"Waypoint {i} must be [x, y, z, rx, ry, rz], got {len(pose)} values."
-            )
-        x, y, z, rx, ry, rz = [float(v) for v in pose]
-        lines.append(f"  global wp{i} = p[{x}, {y}, {z}, {rx}, {ry}, {rz}]")
-    lines.append("end")
-    script_text = "\n".join(lines) + "\n"
-
-    try:
-        transport = paramiko.Transport((robot_ip, 22))
-        try:
-            transport.connect(username=username, password=password)
-            sftp = paramiko.SFTPClient.from_transport(transport)
-            remote_path = f"/programs/{filename}"
-            with sftp.open(remote_path, "w") as handle:
-                handle.write(script_text)
-            return {
-                "status": "uploaded",
-                "filename": filename,
-                "remote_path": remote_path,
-                "waypoints_uploaded": len(waypoints),
-                "next_step": f"Use Dashboard: load {filename}",
-            }
-        finally:
-            transport.close()
-    except Exception as exc:
-        raise RuntimeError(
-            f"Could not upload waypoint script to {robot_ip}:22. "
-            "This helper needs the robot's SSH/SFTP service enabled. "
-            "For the local simulator, use a real controller IP or an SSH-enabled UR host."
-        ) from exc
 
 
 @mcp.tool
