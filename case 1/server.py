@@ -30,6 +30,8 @@ from __future__ import annotations
 import json
 import math
 import re
+import signal
+import sys
 import threading
 import time
 import uuid
@@ -38,6 +40,7 @@ from pathlib import Path
 
 from fastmcp import FastMCP
 
+from motion_patterns import PatternRunner, max_speed_for_radius
 from ur_client import (
     HOME_Q_RAD,
     JOINT_LIMIT,
@@ -1470,6 +1473,272 @@ def movel(
 
 
 # =========================================================================== #
+# CONTINUOUS MOTION PATTERNS  --  open-ended motions the operator steers while
+# they run ("faster", "stop", "keep going"). Every tool here returns at once;
+# the motion itself lives in a URScript loop on the controller, and each
+# command preempts it. The engine is in motion_patterns.py; these are the
+# LLM-facing wrappers. See that module for why blocking tools cannot do this.
+# =========================================================================== #
+
+# Fraction of the container's diameter the stirring circle spans. Below 1.0 so
+# the tool sweeps the contents without scraping the wall.
+STIR_DIAMETER_FRACTION = 0.85
+
+# A gentle stir. Clamped down automatically when a small container's
+# centripetal limit is lower than this.
+DEFAULT_STIR_SPEED_M_S = 0.08
+
+
+def _validate_pattern_pose(pose_m_rad: list[float], what: str) -> None:
+    """Run one pattern waypoint through the Diamond safety layer."""
+    _check_box(*pose_m_rad[:3], what=what)
+    _check_reach(*pose_m_rad[:3], what=what)
+    _check_flange_above_table(pose_m_rad[:3], pose_m_rad[3:])
+
+
+pattern_runner = PatternRunner(
+    robot=robot,
+    validate_pose=_validate_pattern_pose,
+    validate_start=_check_linear_start,
+)
+
+
+@mcp.tool
+def stir(
+    container_diameter_cm: float,
+    motion: str = "circle",
+    speed_m_s: float | None = None,
+    direction: str = "counterclockwise",
+) -> dict:
+    """Start stirring inside a container, and keep stirring until told to stop.
+
+    Call this when the operator asks to stir, mix, swirl or fold something --
+    "stir the pan", "mix that sauce". The robot must already be holding the
+    utensil with its tip IN THE CENTRE of the container, at the depth it should
+    work at: this tool takes the current tool pose as the centre of the circle
+    and never moves up or down from it. If the tool is not in place yet, say so
+    and ask for it to be positioned (by hand in freedrive, or with a move tool)
+    before calling this.
+
+    Returns immediately, while the robot keeps moving. Afterwards use
+    adjust_pattern_speed, pause_motion, resume_motion and finish_motion to
+    steer it, and get_motion_status to check on it.
+
+    Args:
+        container_diameter_cm: Inside diameter of the pan, pot or bowl in
+            centimetres. The stirring circle spans 85% of it, so the utensil
+            sweeps the contents without scraping the wall.
+        motion: "circle" for an ordinary stir (the default), "figure_eight" to
+            fold, "spiral" to work from the centre outwards and back.
+        speed_m_s: Tool speed in metres per second. Omit for a gentle stir;
+            small containers are limited further by how hard the contents can
+            be thrown sideways.
+        direction: "counterclockwise" (default) or "clockwise".
+
+    Returns:
+        A dict with the ``job_id``, the ``radius_m`` being stirred,
+        ``speed_m_s`` and ``laps_per_min``, and ``max_safe_speed_m_s`` -- the
+        ceiling for this container, useful when the operator asks for more.
+
+    Raises:
+        ValueError: A container too small or too large to work in, a speed
+            beyond the safe limit for that radius, a path that leaves the safe
+            workspace, or a pattern already running.
+        RuntimeError: The robot is not powered on, is in a singular pose that
+            cannot start a Cartesian move, or did not begin moving.
+    """
+    if not 2.0 <= container_diameter_cm <= 60.0:
+        raise ValueError(
+            f"Container diameter {container_diameter_cm} cm is outside the "
+            "workable range [2, 60] cm."
+        )
+    if direction not in ("counterclockwise", "clockwise"):
+        raise ValueError(
+            f"direction must be 'counterclockwise' or 'clockwise', got "
+            f"'{direction}'."
+        )
+
+    radius_m = STIR_DIAMETER_FRACTION * (container_diameter_cm / 100.0) / 2.0
+    if speed_m_s is None:
+        speed_m_s = min(DEFAULT_STIR_SPEED_M_S,
+                        0.8 * max_speed_for_radius(radius_m))
+
+    return pattern_runner.start(
+        pattern_name=motion,
+        radius_m=radius_m,
+        speed_m_s=float(speed_m_s),
+        direction=1 if direction == "counterclockwise" else -1,
+    )
+
+
+@mcp.tool
+def start_motion_pattern(
+    pattern: str,
+    radius_m: float,
+    speed_m_s: float,
+    direction: str = "counterclockwise",
+    turns: float = 3.0,
+    points_per_lap: int = 24,
+) -> dict:
+    """Start any repeating motion around the current tool pose.
+
+    The general form of ``stir``, for motions that are not about a container:
+    sweeping a tray, polishing, working a surface. The current tool pose
+    becomes the centre and the orientation is held throughout, so position the
+    tool first.
+
+    Returns immediately, while the robot keeps moving. Steer it afterwards with
+    adjust_pattern_speed, pause_motion, resume_motion and finish_motion.
+
+    Args:
+        pattern: "circle", "figure_eight", "spiral", or "linear_sweep"
+            (back and forth along one axis).
+        radius_m: Half-width of the motion in metres, 0.005 to 0.30.
+        speed_m_s: Tool speed. The safe ceiling falls as the radius shrinks;
+            the error message states the exact limit if you exceed it.
+        direction: "counterclockwise" (default) or "clockwise".
+        turns: For "spiral" only, how many revolutions from centre to rim.
+        points_per_lap: How finely non-circular patterns are sampled. Higher is
+            geometrically truer but slower, because the tighter blend corners
+            cap the speed. Circles ignore this: they run as exact arcs.
+
+    Returns:
+        A dict with ``job_id``, ``laps_per_min``, ``max_safe_speed_m_s``, and
+        ``exact_path`` (True when the path is a true arc rather than sampled).
+
+    Raises:
+        ValueError: Unknown pattern, radius or speed out of range, a path
+            leaving the safe workspace, or a pattern already running.
+        RuntimeError: The robot is not powered on, is in a singular pose, or
+            did not begin moving.
+    """
+    if direction not in ("counterclockwise", "clockwise"):
+        raise ValueError(
+            f"direction must be 'counterclockwise' or 'clockwise', got "
+            f"'{direction}'."
+        )
+    return pattern_runner.start(
+        pattern_name=pattern,
+        radius_m=float(radius_m),
+        speed_m_s=float(speed_m_s),
+        direction=1 if direction == "counterclockwise" else -1,
+        turns=float(turns),
+        points_per_lap=int(points_per_lap),
+    )
+
+
+@mcp.tool
+def adjust_pattern_speed(
+    factor: float | None = None,
+    speed_m_s: float | None = None,
+) -> dict:
+    """Speed the running motion up or slow it down, without interrupting it.
+
+    This is what "faster", "slower", "a bit quicker", "gently" mean while a
+    pattern is running. Prefer ``factor``, since those requests are relative:
+    1.3 for faster, 0.7 for slower, and repeat it if asked again. The tool
+    keeps its place on the path, so the motion continues rather than restarting.
+
+    If the request would throw the contents out of the container, the call is
+    refused and the message gives the fastest safe speed -- report that number
+    rather than retrying blindly. Speed can also be set while paused; it then
+    takes effect on resume.
+
+    Args:
+        factor: Multiplier on the current speed, 0.1 to 10.0.
+        speed_m_s: Absolute tool speed instead, when a number was given.
+
+    Returns:
+        A dict with the new ``speed_m_s`` and ``laps_per_min``, plus
+        ``max_safe_speed_m_s`` for this radius.
+
+    Raises:
+        ValueError: No pattern running, both or neither argument given, or a
+            speed beyond the safe limit.
+    """
+    return pattern_runner.set_speed(factor=factor, speed_m_s=speed_m_s)
+
+
+@mcp.tool
+def pause_motion() -> dict:
+    """Stop the arm now, keeping the motion ready to continue.
+
+    This is what a bare "stop", "wait", "hold on" or "pause" means: the
+    operator wants the arm still, usually to look at something, and expects to
+    say "keep going" afterwards. The arm decelerates smoothly and the anchor,
+    the speed and the place on the path are all kept, so resume_motion carries
+    on from exactly here.
+
+    Prefer this over finish_motion whenever it is not clear that the job is
+    over. Both stop the arm just as quickly; this one is simply recoverable.
+
+    Safe to call at any time: if no pattern is registered but the arm is still
+    moving (a loop left over from an earlier server session), this stops it
+    too, rather than refusing.
+
+    Returns:
+        A dict with ``state`` "paused" and the laps completed so far, or
+        ``status`` "idle" when there was nothing to stop.
+    """
+    return pattern_runner.pause()
+
+
+@mcp.tool
+def resume_motion() -> dict:
+    """Continue a paused motion from where the tool is now.
+
+    This is "keep going", "resume", "continue", "carry on". The phase is read
+    back from the robot's actual position, so the motion picks up smoothly even
+    if the arm was nudged while it was paused.
+
+    Returns:
+        A dict with ``state`` "running" and the current speed.
+
+    Raises:
+        ValueError: No pattern to resume.
+        RuntimeError: The robot is not powered on, or did not begin moving.
+    """
+    return pattern_runner.resume()
+
+
+@mcp.tool
+def finish_motion() -> dict:
+    """End the motion for good and forget the anchor.
+
+    This is "that's enough", "we're done", "stop stirring" -- the task is over,
+    not merely interrupted. Once finished the motion cannot be resumed; a new
+    stir has to be positioned and started again. When in doubt between this and
+    pause_motion, pause.
+
+    Safe to call at any time: if no pattern is registered but the arm is still
+    moving, this stops it too, rather than refusing.
+
+    Returns:
+        A dict with the total laps completed and how long the job lasted, or
+        ``status`` "idle" when there was nothing to stop.
+    """
+    return pattern_runner.finish()
+
+
+@mcp.tool
+def get_motion_status() -> dict:
+    """Report what the running motion is doing, without disturbing it.
+
+    Always safe to call. Use it to answer "is it still stirring?", to check
+    progress, or to find out why a motion stopped on its own -- a protective
+    stop shows up here as a ``safety_status`` other than 1.
+
+    Returns:
+        When idle, ``status`` "idle" and ``active`` False. When a pattern
+        exists: its ``state`` ("running" or "paused"), ``motion`` name,
+        ``speed_m_s``, ``laps_per_min``, ``laps_completed``, the ``anchor``
+        pose, and the live ``tcp_pose_m_rad``, ``robot_moving`` and
+        ``safety_status``.
+    """
+    return pattern_runner.status()
+
+
+# =========================================================================== #
 # TEMPLATE TOOL  --  the minimal shape of a tool, doing nothing real. Copy this
 # to start your own, then follow the four-step pattern above. Add as many as
 # the tiers need.
@@ -1485,4 +1754,8 @@ def example() -> str:
 
 if __name__ == "__main__":
     robot.connect()
+    # A motion pattern runs as a loop ON THE CONTROLLER, so it outlives this
+    # process. MCP clients stop their servers with SIGTERM, which would skip
+    # the atexit cleanup and leave the robot moving; turn it into a normal exit.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
     mcp.run()

@@ -25,6 +25,8 @@ docstrings, because the model reads them to decide when and how to call a tool.
 | `ur_client.py` | pure standard-library seam over the robot (motion + state) | done, do not touch |
 | `test_server.py` | in-process smoke test for both tools | provided |
 | `requirements.txt` | one dependency, the MCP framework | provided |
+| `motion_patterns.py` | engine for continuous, steerable motions (stirring) | ours |
+| `test_motion_patterns.py` | in-process test of a full stirring session | ours |
 
 ## Setup
 
@@ -59,7 +61,10 @@ motion, without an LLM or a subprocess:
 python test_server.py
 ```
 If the robot is off, both fail with a clear "not powered on" message. That error
-is the guard working.
+is the guard working. The steerable motions have their own test:
+```bash
+python test_motion_patterns.py
+```
 
 **3. Connect a client.** The server speaks MCP over stdio: the client launches
 `server.py` and talks to it over stdin/stdout, so you do not start it and connect
@@ -112,6 +117,50 @@ command is `python3` and whose argument is the absolute path to `server.py`.
 - **Diamond, real skills:** add a gripper / IO tool or a compound skill (a
   pick-and-place primitive), and surface `safety_status` so a client can detect a
   protective stop.
+
+## Continuous motion patterns
+
+Every other tool here is one-shot: it blocks until the robot arrives, then
+returns. That cannot express an open-ended motion the operator steers while it
+runs, because while a tool call is pending the LLM is not running, so the next
+thing the operator says cannot reach it. Stirring a pan is exactly that kind of
+motion, so it works differently.
+
+Position the tool in the centre of the container first (by hand in freedrive,
+or with a move tool), then:
+
+| Say | Tool | What happens |
+|-----|------|--------------|
+| "stir the pan, it's 10 cm across" | `stir` | anchors on the current pose, starts circling, **returns at once** |
+| "faster" / "slower" | `adjust_pattern_speed` | `factor=1.3` / `0.7`, keeping the tool's place on the path |
+| "stop", "wait", "hold on" | `pause_motion` | smooth stop; anchor, speed and phase all kept |
+| "keep going" | `resume_motion` | continues from wherever the tool now sits |
+| "that's enough", "we're done" | `finish_motion` | stops for good and releases the anchor |
+| "is it still going?" | `get_motion_status` | laps, speed, live pose, safety status |
+
+`start_motion_pattern` is the general form for motions that are not about a
+container, with `figure_eight`, `spiral` and `linear_sweep` alongside `circle`.
+A new pattern is one function plus a registry entry in `motion_patterns.py`.
+
+Three things worth knowing before changing any of it:
+
+- **The motion runs on the controller, not here.** Each tool uploads a URScript
+  loop; a new upload preempts the running one, which is how a speed change
+  becomes seamless. It also means the loop outlives this process, so the server
+  stops it on exit, and `pause_motion` / `finish_motion` stop a leftover loop
+  even when no job is registered.
+- **Circles use `movec`, everything else a polygon of blended `movel`.** On the
+  polygon the blend corners cap the speed near `sqrt(a · r_blend)`: commanding
+  0.128 m/s instead of 0.080 m/s measured 0.0715 vs 0.0718 m/s, i.e. no change
+  at all. `movec` follows a true arc and honours the commanded speed to ~95%.
+- **The controller enforces no centripetal limit.** 0.40 m/s on a 30 mm circle
+  ran fine while demanding 5.3 m/s². Keeping the contents in the pan is the
+  server's job: `max_speed_for_radius` caps it, which is why a 10 cm pan tops
+  out near 0.23 m/s.
+
+```bash
+python test_motion_patterns.py   # start, faster, pause, resume, finish
+```
 
 ## The tool pattern
 
