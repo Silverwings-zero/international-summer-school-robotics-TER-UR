@@ -230,6 +230,25 @@ UR_MODEL = os.environ.get("UR_MODEL", "ur10e").strip().lower()
 if UR_MODEL not in _UR_MODELS:
     raise SystemExit(
         f"Unknown UR_MODEL '{UR_MODEL}'; pick one of {sorted(_UR_MODELS)}")
+
+# The default above is the SIMULATOR's arm, which is only safe because the
+# host default is the simulator too. Pointing at real hardware without saying
+# which arm it is would hand the safety layer a UR10e's reach (1.37 m vs the
+# UR5e's 0.95), payload (12.5 kg vs 5.0) and workspace box -- so every check
+# below would APPROVE targets the real robot cannot survive, and the ur10e
+# waypoint bank would be loaded on top. That is the one combination CLAUDE.md
+# rules out, so refuse it here rather than guarding the wrong arm.
+_UR_HOST = os.environ.get("UR_HOST", "127.0.0.1").strip()
+_HOST_IS_LOOPBACK = (_UR_HOST in ("localhost", "::1", "")
+                     or _UR_HOST.startswith("127."))
+if not _HOST_IS_LOOPBACK and "UR_MODEL" not in os.environ:
+    raise SystemExit(
+        f"Refusing to start: UR_HOST={_UR_HOST} is not the simulator, but "
+        f"UR_MODEL is unset so the safety layer would guard a "
+        f"'{UR_MODEL}'.\n"
+        f"Name the arm explicitly -- UR_MODEL=ur5e for the summer-school "
+        f"UR5e -- or launch through run_vision_root.sh, which pins the host "
+        f"and the model together so they cannot disagree.")
 _MODEL = _UR_MODELS[UR_MODEL]
 
 # Safe workspace for the tool, base frame, metres. The tool tip may work down
@@ -258,9 +277,8 @@ _MAX_STORED_PROGRESS_SAMPLES = 500
 # non-simulator model gets its own bank file; the legacy unsuffixed file
 # belongs to the ur10e simulator it was recorded on.
 _WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name(
-    "waypoints_lookup_table.json"
-    if os.environ.get("UR_MODEL", "ur10e").strip().lower() == "ur10e"
-    else f"waypoints_lookup_table.{os.environ.get('UR_MODEL').strip().lower()}.json")
+    "waypoints_lookup_table.json" if UR_MODEL == "ur10e"
+    else f"waypoints_lookup_table.{UR_MODEL}.json")
 _WAYPOINT_BANK_LOCK = threading.Lock()
 
 

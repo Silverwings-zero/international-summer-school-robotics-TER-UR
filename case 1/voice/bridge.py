@@ -93,7 +93,14 @@ async def connect_tools(command: str, args: list[str],
     from mcp import ClientSession, StdioServerParameters
     from mcp.client.stdio import stdio_client
 
-    params = StdioServerParameters(command=command, args=args)
+    # The MCP SDK does NOT inherit the environment. With ``env`` left unset it
+    # falls back to ``get_default_environment()``, which forwards only HOME,
+    # LOGNAME, PATH, SHELL, TERM and USER -- so every UR_* / VISION_* variable
+    # was silently dropped on the floor and `UR_MODEL=ur5e python run_voice.py`
+    # configured nothing at all. Pass the environment through explicitly, or
+    # the server can only ever be configured through its argv.
+    params = StdioServerParameters(command=command, args=args,
+                                   env=dict(os.environ))
     errlog = open(log_path, "w", encoding="utf-8") if log_path else None
     try:
         stream = stdio_client(params) if errlog is None else \

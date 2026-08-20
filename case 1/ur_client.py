@@ -120,9 +120,16 @@ class URClient:
     Args:
         host: Robot / simulator IP. Defaults to the ``UR_HOST`` env var, then to
             ``127.0.0.1`` (the simulator's published address on your machine).
+            The fallback is deliberately the SIMULATOR: a process that forgot
+            to configure itself must not reach the arm in the room. Every
+            real-robot entry point names the host explicitly -- the argument to
+            ``run_vision_root.sh``, ``UR_HOST`` in the mcp.*.json configs, the
+            IP argument to ``preflight_real_robot.py`` -- so nothing depends on
+            this default pointing at hardware. See also server.py's refusal to
+            guard a non-loopback host with an unstated UR_MODEL.
     """
 
-    host: str = field(default_factory=lambda: os.environ.get("UR_HOST", "192.168.1.100"))
+    host: str = field(default_factory=lambda: os.environ.get("UR_HOST", "127.0.0.1"))
     _ur_variable_expr: dict[str, str] = field(default_factory=dict,
                                                init=False, repr=False)
     _ur_variable_lock: threading.Lock = field(default_factory=threading.Lock,
