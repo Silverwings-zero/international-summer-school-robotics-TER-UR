@@ -1,14 +1,7 @@
 {
   "pose_prefix": "waypoint_",
-  "pose_count": 40,
-  "pose_default": [
-    0.45,
-    -0.3,
-    1.2,
-    0.0,
-    3.141593,
-    0.0
-  ],
+  "pose_count": 0,
+  "pose_default": [],
   "joint_prefix": "jointpoint_",
   "joint_count": 20,
   "joint_default": [
