@@ -16,8 +16,8 @@ envelope, and loopback or nothing means the local simulator and its ur10e. Guard
 approve targets 40 cm past its reach, so ``server.py`` refuses that pairing
 outright. ``--vision`` (the default) launches the merged camera+robot server
 through ``run_server.sh`` (under sudo on macOS, the only way librealsense can
-claim the D435 on macOS -- and yields 37 tools; ``--no-vision`` launches
-``server.py`` directly for 29 tools and no perception at all.
+claim the D435 on macOS -- and yields 35 tools; ``--no-vision`` launches
+``server.py`` directly for 27 tools and no perception at all.
 
 At the prompt: ENTER starts and stops a recording, ``!`` stops the robot
 immediately, ``q`` quits. Ctrl-C also stops the robot before exiting.
@@ -49,11 +49,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 # folders are called.
 _CASE1 = os.path.abspath(os.path.join(_HERE, os.pardir))
 
-# The robot-only server: 29 tools, no root needed, and NO camera. Launched with
+# The robot-only server: 27 tools, no root needed, and NO camera. Launched with
 # the interpreter running this script so it inherits the same virtualenv on
 # machines with no bare `python` on PATH.
 _ROBOT_ONLY_SERVER = os.path.join(_CASE1, "server.py")
-# The merged server: those same 29 tools plus the 8 wrist-camera ones. It goes
+# The merged server: those same 27 tools plus the 8 wrist-camera ones. It goes
 # through the wrapper rather than being invoked directly because UR_VISION and
 # every UR_*/VISION_* setting live INSIDE that file -- sudo strips the
 # environment, so the robot has to arrive as an argument instead.
@@ -181,10 +181,10 @@ def parse_args() -> argparse.Namespace:
                          "and ur10e without it")
     ap.add_argument("--vision", action=argparse.BooleanOptionalAction,
                     default=True,
-                    help="launch the merged 37-tool camera+robot server via "
+                    help="launch the merged 35-tool camera+robot server via "
                          "run_server.sh (needs a passwordless sudo rule "
                          "naming that exact path); --no-vision falls back to "
-                         "the 29-tool robot-only server, which cannot see")
+                         "the 27-tool robot-only server, which cannot see")
     ap.add_argument("--backend", choices=["claude", "openai"], default="claude",
                     help="'claude' uses your Claude Code subscription via the "
                          "claude CLI (no API key); 'openai' uses an "

@@ -46,8 +46,7 @@ REQUIRED_TOOLS = {
     "move_linear", "run_trajectory", "start_trajectory_job",
     "get_trajectory_job_status", "set_payload",
     "set_payload_mass", "set_gravity",
-    "store_waypoint_pose_on_ur", "store_joint_configuration_on_ur",
-    "move_to_stored_tcp_waypoint", "move_to_stored_joint_configuration",
+    "store_waypoint_on_ur", "load_stored_waypoint",
     "get_tool_digital_in", "set_tool_digital_out",
     "example",
 }
@@ -187,31 +186,35 @@ async def main() -> None:
         assert final_result and final_result["status"] == "reached"
         print("trajectory job: completed with", next_index, "progress samples")
 
-        # --- Silver/Gold: store + immediate reuse across calls ----------- #
-        stored_tcp = await client.call_tool("store_waypoint_pose_on_ur", {
+        # --- Silver/Gold: store + read back + reuse across calls -------- #
+        # load_stored_waypoint is READ-ONLY: it hands back the values, and the
+        # caller does the moving. Both pose types must survive the round trip.
+        stored_tcp = await client.call_tool("store_waypoint_on_ur", {
             "variable_name": "tmp_waypoint_now",
+            "pose_type": "tcp",
         })
         assert stored_tcp.data["status"] == "stored_on_ur"
-        moved_tcp = await client.call_tool("move_to_stored_tcp_waypoint", {
+        loaded_tcp = await client.call_tool("load_stored_waypoint", {
             "variable_name": "tmp_waypoint_now",
-            "speed": 0.2,
-            "acceleration": 1.0,
-            "timeout_s": 20.0,
         })
-        assert moved_tcp.data["status"] == "executed"
+        assert loaded_tcp.data["pose_type"] == "tcp", loaded_tcp.data
 
-        stored_q = await client.call_tool("store_joint_configuration_on_ur", {
+        stored_q = await client.call_tool("store_waypoint_on_ur", {
             "variable_name": "tmp_joint_now",
         })
         assert stored_q.data["status"] == "stored_on_ur"
-        moved_q = await client.call_tool("move_to_stored_joint_configuration", {
+        loaded_q = await client.call_tool("load_stored_waypoint", {
             "variable_name": "tmp_joint_now",
+        })
+        assert loaded_q.data["pose_type"] == "joints", loaded_q.data
+        # ...and the joints it hands back must be commandable as-is.
+        replay = await client.call_tool("move_robot_to_position", {
+            "joint_angles_deg": loaded_q.data["value_deg"],
             "speed": 0.8,
             "acceleration": 1.0,
-            "timeout_s": 20.0,
         })
-        assert moved_q.data["status"] == "executed"
-        print("stored variables: immediate waypoint + joint reuse confirmed")
+        assert replay.data["status"] == "reached", replay.data
+        print("stored variables: tcp + joint round trip, joints replayed")
 
         # --- Silver: commissioning/utility tools + input validation ------- #
         payload = await client.call_tool("set_payload", {

@@ -4,7 +4,7 @@ This repo runs a UR arm as a **collaborative kitchen robot**. The user gives a
 general command ("pour milk into the coffee"); Claude plans it with the MCP
 tools below, narrates the plan, and executes it **step by step together with
 the user** — the robot does what it can, and asks the human for everything it
-cannot do. **One MCP server, `ur-tools`, provides every tool** (37 of them):
+cannot do. **One MCP server, `ur-tools`, provides every tool** (35 of them):
 
 - motion, gripper, waypoints, patterns, IO — `case 1/server.py`.
 - wrist-camera perception and visual servoing (look, track, descend) —
@@ -28,7 +28,7 @@ caps), so the two can no longer split-brain. Never drive the real UR5e with
 `UR_MODEL=ur10e`.
 
 Without `UR_VISION`, `case 1/server.py` still starts alone as a robot-only
-server with 29 tools and needs no root — that is what the voice front-end
+server with 27 tools and needs no root — that is what the voice front-end
 (`case 1/voice/run_voice.py --no-vision`) launches. A missing camera stack
 costs the perception tools, not the whole robot: the mount is wrapped in a
 `try`, and an import failure only prints `camera unavailable` to stderr.
@@ -160,8 +160,9 @@ When the object is beyond the gripper (fork, packet, lid) — or a grasp
 failed twice:
 
 1. Announce it: "I can't grasp the fork reliably — please hand it to me."
-2. `move_to_stored_joint_configuration("handover_pose")`, then open the
-   gripper: `set_tool_digital_out(n=1, b=true)` (slow) and
+2. `load_stored_waypoint("handover_pose")` — it only reads the pose back, so
+   feed its `value_deg` to `move_robot_to_position`. Then open the gripper:
+   `set_tool_digital_out(n=1, b=true)` (slow) and
    `set_tool_digital_out(n=0, b=true)`.
 3. Ask the user to hold the object **between the fingers** and say/confirm
    when ready. Never close on a signal the user did not give.

@@ -28,7 +28,7 @@ everything new is vision.
 
 This folder is a subpackage of case 1, the sibling of `../voice/`: the same
 server owns motion and perception, and `../run_server.sh` starts both as one
-37-tool MCP. It was case 4 until the stack was consolidated; every path here
+35-tool MCP. It was case 4 until the stack was consolidated; every path here
 is relative, so the tree moves without edits.
 
 ## Setup

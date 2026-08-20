@@ -38,6 +38,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Literal
 
 from fastmcp import FastMCP
 
@@ -663,7 +664,6 @@ def move_robot_to_position(
     acceleration: float = DEFAULT_ACCEL,
 ) -> dict:
     """Move the robot to an absolute joint configuration and report the result.
-    Alias: move_joints_absolute, move_joints, move_j
 
     Give six target joint angles in degrees, ordered base, shoulder, elbow,
     wrist1, wrist2, wrist3. Omit them to send the robot to its HOME position
@@ -869,7 +869,6 @@ def move_linear(
     acceleration: float = 1.2,
 ) -> dict:
     """Move the TOOL TIP in a straight line to a Cartesian position.
-    Alias: move_l
 
     Use this when the path matters, not just the destination: approaching,
     inserting, drawing -- the tool tip travels a straight line in space
@@ -1503,8 +1502,10 @@ def store_waypoint_on_ur(
         To keep the value available across restarts and visible in PolyScope,
         create the same name as an Installation variable and use that variable
         in the relevant program node. The server also caches the value so
-        the corresponding move_to_stored_* tool can use it immediately in
-        later calls, even when the controller program context has restarted.
+        ``load_stored_waypoint`` can read it back immediately in later calls,
+        even when the controller program context has restarted. That tool is
+        read-only: hand its values to move_robot_to_position (joints) or
+        move_linear (tcp) to actually move.
     """
     name = _validate_ur_variable_name(variable_name)
 
@@ -1720,7 +1721,7 @@ def load_stored_waypoint(variable_name: str) -> dict:
             "pose_type": "joints",
             "value_rad": [round(v, 6) for v in q_rad],
             "value_deg": [round(math.degrees(v), 3) for v in q_rad],
-            "recommended_next_tool": "move_j",
+            "recommended_next_tool": "move_robot_to_position",
         }
 
     pose_entry = bank.get("pose_variables", {}).get(name)
@@ -1742,7 +1743,7 @@ def load_stored_waypoint(variable_name: str) -> dict:
             "variable_name": name,
             "pose_type": "tcp",
             "value_m_rad": [round(v, 6) for v in pose],
-            "recommended_next_tool": "move_l",
+            "recommended_next_tool": "move_linear",
         }
 
     raise ValueError(
