@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import atexit
 import math
+import os
 import socket
 import threading
 import time
@@ -72,6 +73,19 @@ SAFETY_SAMPLES_PER_CYCLE = 72
 # A blend radius must stay below half the shortest adjoining segment or the
 # controller rejects it; 0.4 leaves margin for rounding.
 BLEND_FRACTION_OF_CHORD = 0.4
+
+# Real controllers reject a blend radius that rounds to nothing ("blend radius
+# too small") where the simulator quietly accepts it. Anything below this is
+# emitted as an unblended move instead, which is always legal.
+MIN_BLEND_M = 0.001
+
+# Fraction of the end-to-via arc distance a blend may occupy. See _arc_blend.
+ARC_VIA_MARGIN = 0.5
+
+# Escape hatch for controllers that reject movec regardless: set
+# UR_EXACT_ARCS=0 and circles are drawn as blended movel polygons instead.
+# Visually identical for stirring, and it avoids movec entirely.
+USE_EXACT_ARCS = os.environ.get("UR_EXACT_ARCS", "1").strip() != "0"
 
 # Skip the lead-in move when the tool is already this close to the entry point.
 LEAD_IN_TOLERANCE_M = 0.002
@@ -238,17 +252,43 @@ def _lead_in(anchor: list[float], entry: list[float], speed: float,
     return f"  movel({_fmt_pose(entry)}, a={accel:.4f}, v={speed:.4f})\n"
 
 
+def _arc_blend(radius_m: float) -> float:
+    """Blend radius joining one arc of the circle to the next.
+
+    Blending is geometrically free here: consecutive arcs of the same circle
+    are tangent, so the blend does not cut a corner -- it only removes the
+    full stop the controller would otherwise make at every arc end. With
+    ARCS_PER_LAP=4 that is four stop-and-go events per lap, which on a real
+    arm is both jerky and, on some controllers, rejected outright.
+
+    The cap is what matters on real hardware. UR's own explanation of
+    "movec: Blend radius too small" is that "the via pose is not handled with
+    the blend in mind" -- the via point sits at the arc's midpoint, and a blend
+    that reaches back that far leaves the controller unable to solve the
+    geometry. Staying under ARC_VIA_MARGIN of the end-to-via distance keeps the
+    blend well clear of it.
+
+    Returns 0.0 when the arc is too short to carry a legal blend, which makes
+    the caller emit an unblended move rather than an invalid one.
+    """
+    half_arc = math.pi * radius_m / ARCS_PER_LAP      # end -> via, along the arc
+    chord = 2.0 * radius_m * math.sin(math.pi / ARCS_PER_LAP)
+    blend = min(BLEND_FRACTION_OF_CHORD * chord, ARC_VIA_MARGIN * half_arc)
+    return blend if blend >= MIN_BLEND_M else 0.0
+
+
 def _circle_loop(anchor: list[float], radius_m: float, speed: float,
                  accel: float, start_phase: float, direction: int) -> str:
-    """A never-ending true circle, as ARCS_PER_LAP movec segments."""
+    """A never-ending true circle, as ARCS_PER_LAP blended movec segments."""
     lines = ["  while True:\n"]
     step = 2 * math.pi / ARCS_PER_LAP
+    blend = _arc_blend(radius_m)
     for i in range(ARCS_PER_LAP):
         base = start_phase + direction * step * i
         via = _pose_at(anchor, _circle(base + direction * step / 2, {"radius_m": radius_m}))
         end = _pose_at(anchor, _circle(base + direction * step, {"radius_m": radius_m}))
         lines.append(f"    movec({_fmt_pose(via)}, {_fmt_pose(end)}, "
-                     f"a={accel:.4f}, v={speed:.4f}, r=0.0)\n")
+                     f"a={accel:.4f}, v={speed:.4f}, r={blend:.4f})\n")
     lines.append("  end\n")
     return "".join(lines)
 
@@ -272,6 +312,11 @@ def _polygon_loop(anchor: list[float], pattern: Pattern, params: dict,
         incoming = lengths[i - 1]
         outgoing = lengths[i]
         blend = BLEND_FRACTION_OF_CHORD * min(incoming, outgoing)
+        # linear_sweep bunches its samples at the turning points, so this can
+        # come out at a few microns -- below what a real controller accepts.
+        # Emit no blend at all rather than an illegal one.
+        if blend < MIN_BLEND_M:
+            blend = 0.0
         lines.append(f"    movel({_fmt_pose(pose)}, a={accel:.4f}, "
                      f"v={speed:.4f}, r={blend:.4f})\n")
     lines.append("  end\n")
@@ -284,7 +329,7 @@ def _build_script(anchor: list[float], pattern: Pattern, params: dict,
                   current_tcp: list[float]) -> str:
     entry = _pose_at(anchor, pattern.offset(start_phase, params))
     body = _lead_in(anchor, entry, speed, accel, current_tcp)
-    if pattern.exact_arcs:
+    if pattern.exact_arcs and USE_EXACT_ARCS:
         body += _circle_loop(anchor, params["radius_m"], speed, accel,
                              start_phase, direction)
     else:

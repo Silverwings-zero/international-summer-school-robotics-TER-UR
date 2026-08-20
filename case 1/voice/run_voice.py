@@ -1,0 +1,256 @@
+"""Entry point: talk to the UR10e out loud.
+
+    python voice/run_voice.py                 # voice in, voice out
+    python voice/run_voice.py --text          # typed in, voice out (no mic)
+    python voice/run_voice.py --tts none      # typed/spoken in, printed out
+    python voice/run_voice.py --list-devices  # which microphone is which
+
+At the prompt: ENTER starts and stops a recording, ``!`` stops the robot
+immediately, ``q`` quits. Ctrl-C also stops the robot before exiting.
+
+Nothing here is required by ``server.py``. Kill this program and the MCP server
+is still a normal MCP server for Claude Code, Cursor or the Case 3 agent.
+"""
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+import shlex
+import sys
+
+from bridge import LLMClient, connect_tools
+from conversation import STOP_ACKNOWLEDGED, VoiceAgent
+from tts import DEFAULT_VOICE, make_speaker
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The Case 1 server, launched with the interpreter running this script so it
+# inherits the same virtualenv on machines with no bare `python` on PATH.
+DEFAULT_SERVER = (
+    f"{shlex.quote(sys.executable)} "
+    f"{shlex.quote(os.path.join(_HERE, os.pardir, 'server.py'))}"
+)
+
+# FastMCP logs a full traceback for every rejected tool call. Useful, but not
+# on top of a spoken conversation, so it lands here instead.
+DEFAULT_SERVER_LOG = os.path.join(_HERE, "server.log")
+
+BANNER = """\
+=========================================================
+ UR10e -- voice assistant
+ [ENTER] speak    [!] STOP the robot    [q] quit
+=========================================================\
+"""
+
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--server", default=DEFAULT_SERVER,
+                    help="command that launches the MCP server (quoted)")
+    ap.add_argument("--backend", choices=["claude", "openai"], default="claude",
+                    help="'claude' uses your Claude Code subscription via the "
+                         "claude CLI (no API key); 'openai' uses an "
+                         "OpenAI-compatible endpoint via AGENT_* variables")
+    ap.add_argument("--model", default=None,
+                    help="model id; default is whatever the backend is set to")
+    ap.add_argument("--text", action="store_true",
+                    help="type instead of speaking (no microphone needed)")
+    ap.add_argument("--tts", choices=["edge", "none"], default="edge",
+                    help="'edge' for neural voice, 'none' to print replies")
+    ap.add_argument("--voice", default=DEFAULT_VOICE,
+                    help="Edge voice id (edge-tts --list-voices)")
+    ap.add_argument("--rate", default="+0%",
+                    help="speech speed, e.g. '+15%%' for a faster demo")
+    ap.add_argument("--stt-model", default="base",
+                    help="faster-whisper size: tiny, base, small, medium")
+    ap.add_argument("--language", default="en",
+                    help="spoken language code, or 'auto' to detect")
+    ap.add_argument("--input-device", default=None,
+                    help="microphone index or name substring (see "
+                         "--list-devices); defaults to $VOICE_INPUT_DEVICE")
+    ap.add_argument("--list-devices", action="store_true",
+                    help="print the audio devices and exit")
+    ap.add_argument("--quiet", action="store_true",
+                    help="hide tool calls (cleaner for the demo)")
+    ap.add_argument("--server-log", default=DEFAULT_SERVER_LOG,
+                    help="file for the server's stderr ('-' to keep it on screen)")
+    return ap.parse_args()
+
+
+def build_transcriber(args: argparse.Namespace):
+    """Load Whisper up front, so the first utterance is not slow."""
+    from stt import Transcriber
+
+    print(f"loading Whisper '{args.stt_model}'...", flush=True)
+    return Transcriber(
+        model_size=args.stt_model,
+        language=None if args.language == "auto" else args.language,
+    )
+
+
+def get_input_device(raw: str | None) -> int | str | None:
+    """Accept either an index ('3') or a name substring ('USB')."""
+    if raw is None:
+        return None
+    return int(raw) if raw.isdigit() else raw
+
+
+def build_mic(args: argparse.Namespace):
+    """Resolve the microphone once, before the conversation starts.
+
+    Probing sample rates opens and closes streams and makes ALSA write to
+    stderr, so doing it per utterance would be both slow and noisy.
+    """
+    from stt import MicConfig
+
+    mic = MicConfig.resolve(get_input_device(args.input_device))
+    print(mic.describe())
+    return mic
+
+
+async def main() -> int:
+    args = parse_args()
+
+    if args.list_devices:
+        from stt import list_input_devices
+        print(list_input_devices())
+        return 0
+
+    speaker = make_speaker(kind=args.tts, voice=args.voice, rate=args.rate)
+    try:
+        mic = None if args.text else build_mic(args)
+    except RuntimeError as exc:
+        print(f"\n{exc}\n\nUntil the microphone works, use --text.",
+              file=sys.stderr)
+        speaker.close()
+        return 3
+    transcriber = None if args.text else build_transcriber(args)
+
+    command, *server_args = shlex.split(args.server)
+    log_path = None if args.server_log == "-" else args.server_log
+
+    if args.backend == "claude":
+        try:
+            # Probe the SDK itself: claude_backend imports it lazily, so
+            # importing that module alone would not catch a missing install
+            # and the failure would surface later as a traceback.
+            import claude_agent_sdk  # noqa: F401
+
+            from claude_backend import ClaudeCodeAgent
+        except ImportError:
+            print("\nThe claude backend needs the Agent SDK:\n"
+                  "  pip install claude-agent-sdk\n"
+                  "and a logged-in CLI (check: claude --version).\n"
+                  "Or run with --backend openai.", file=sys.stderr)
+            speaker.close()
+            return 2
+        async with ClaudeCodeAgent(command, server_args, model=args.model,
+                                   verbose=not args.quiet) as agent:
+            print(f"connected: {len(agent.tool_names)} tools available "
+                  f"(brain: Claude Code subscription)")
+            print(BANNER)
+            await converse(args, agent, speaker, transcriber, mic)
+        speaker.close()
+        print("closed. The MCP server remains usable on its own.")
+        return 0
+
+    try:
+        llm = LLMClient()
+    except ValueError as exc:
+        # Missing configuration is the single most common first-run failure;
+        # a traceback here teaches nobody anything.
+        print(f"\n{exc}\n\n  export AGENT_BASE_URL=...\n"
+              "  export AGENT_API_KEY=...\n  export AGENT_MODEL=...\n\n"
+              "Free endpoints are listed in ../../llm-client/.\n"
+              "Or use the default --backend claude.", file=sys.stderr)
+        speaker.close()
+        return 2
+
+    async with connect_tools(command, server_args, log_path=log_path) as tools:
+        schemas = await tools.openai_tools()
+        agent = VoiceAgent(tools, schemas, llm, verbose=not args.quiet)
+        print(f"connected: {len(schemas)} tools available "
+              f"(brain: {llm.model})")
+        if log_path:
+            print(f"server log: {log_path}")
+        print(BANNER)
+        await converse(args, agent, speaker, transcriber, mic)
+
+    speaker.close()
+    print("closed. The MCP server remains usable on its own.")
+    return 0
+
+
+async def converse(args, agent, speaker, transcriber, mic) -> None:
+    """The input loop, shared by both backends.
+
+    Both agents expose the same two methods -- ``ask`` and ``emergency_stop``
+    -- so nothing below cares which brain is behind them.
+    """
+    while True:
+        try:
+            utterance = await asyncio.to_thread(
+                read_utterance, args, transcriber, mic
+            )
+        except KeyboardInterrupt:
+            print("\ninterrupted -- stopping the robot")
+            await agent.emergency_stop()
+            return
+
+        if utterance is None:            # quit
+            return
+        if utterance == "!":             # hard stop, no LLM in the path
+            result = await agent.emergency_stop()
+            print(f"     {result[:200]}")
+            await asyncio.to_thread(speaker.say, STOP_ACKNOWLEDGED)
+            continue
+        if not utterance:                # silence or misfire
+            print("  (did not catch that, try again)")
+            continue
+
+        print(f"you> {utterance}")
+        try:
+            reply = await agent.ask(utterance)
+        except KeyboardInterrupt:
+            print("\ninterrupted -- stopping the robot")
+            await agent.emergency_stop()
+            return
+        except Exception as exc:
+            reply = f"Error: {exc}"
+        # Synthesis and playback block for seconds; keep them off the event
+        # loop so the MCP subprocess pipes stay serviced meanwhile.
+        await asyncio.to_thread(speaker.say, reply)
+
+
+def read_utterance(args: argparse.Namespace, transcriber, mic) -> str | None:
+    """One turn of input. Returns None to quit, '!' to stop, '' for silence.
+
+    Runs on a worker thread (both ``input()`` and Whisper block), which keeps
+    the event loop free to service the MCP subprocess pipes.
+    """
+    from stt import record_until_enter, wait_for_key
+
+    if args.text:
+        line = wait_for_key("\nyou> ")
+        if line in ("q", "quit", "exit"):
+            return None
+        return line
+
+    line = wait_for_key("\n[ENTER] speak  |  [!] stop  |  [q] quit > ")
+    if line in ("q", "quit", "exit"):
+        return None
+    if line == "!":
+        return "!"
+
+    audio = record_until_enter(mic)
+    print("  transcribing...", flush=True)
+    return transcriber.transcribe(audio)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(asyncio.run(main()))
+    except KeyboardInterrupt:
+        sys.exit(130)
