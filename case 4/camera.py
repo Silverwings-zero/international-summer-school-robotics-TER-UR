@@ -5,7 +5,9 @@ Two implementations behind one tiny interface (``read() -> Frame``):
   * ``RealSenseCamera`` -- an Intel RealSense D435 on USB. Streams color plus
     depth ALIGNED to the color image, and reads the factory intrinsics off the
     device, so a pixel + its depth convert straight to a 3D offset in the
-    camera frame. This is the one you want on the real setup.
+    camera frame. This is the one you want on the real setup. By default it
+    is reached through ``SubprocessCamera``, which runs it in a child process
+    so a librealsense segfault cannot take the caller down with it.
   * ``WebcamCamera`` -- any UVC webcam (including the D435's RGB sensor when
     the librealsense Python bindings are not installed on this machine).
     No depth; the servo loop then centers in the image plane only and skips
@@ -17,7 +19,11 @@ break on a machine where it is missing.
 """
 from __future__ import annotations
 
+import json
 import os
+import select
+import signal
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -268,6 +274,169 @@ class RealSenseCamera:
             pass  # already stopped
 
 
+class SubprocessCamera:
+    """A ``RealSenseCamera`` in a child process, behind the same ``read()``.
+
+    librealsense 2.56.5 on macOS segfaults in
+    ``usb_context::usb_context() -> libusb_get_device_list`` (SIGSEGV at
+    0x28: a NULL libusb context used after ``libusb_init()`` failed). It
+    fires from ``rs2_create_pipeline`` and from the ~1 Hz device-watcher
+    thread every ``rs.context()`` starts -- and ``rs.pipeline(ctx)`` builds
+    its own ``device_hub``/``usb_context`` regardless of the cached
+    ``_RS_CTX``, so no amount of Python discipline prevents it and no
+    ``except`` clause can catch a native crash.
+
+    In the merged ``ur-tools`` server that crash killed the process, so a
+    camera fault also took every MOTION tool down (the MCP client silently
+    respawned it, surfacing only as "Connection closed"). Isolating the
+    camera turns that into an ordinary tool error: the pipe closes, the exit
+    status is negative, and the robot half never notices.
+
+    ``camera_worker.py`` documents the wire protocol. This side is a plain
+    request/response client with its own buffer -- ``select`` on the raw fd
+    would miss bytes already sitting in a Python-level buffer, so the reads
+    below go through ``os.read`` only.
+    """
+
+    #: Opening the D435 walks a retry ladder (up to eight profile attempts,
+    #: each with a 5 s frame probe) and may hardware-reset first, so the
+    #: handshake needs a generous budget. A crash still surfaces at once:
+    #: the pipe hits EOF rather than idling out this deadline.
+    OPEN_TIMEOUT_S = 150.0
+    #: Added to the caller's ``timeout_ms`` to cover the frame's trip up the
+    #: pipe, so the worker's own timeout is what actually fires first.
+    READ_GRACE_S = 5.0
+
+    def __init__(self, width: int = 640, height: int = 480, fps: int = 30):
+        here = os.path.dirname(os.path.abspath(__file__))
+        worker = os.path.join(here, "camera_worker.py")
+        env = dict(os.environ, VISION_CAMERA_WIDTH=str(width),
+                   VISION_CAMERA_HEIGHT=str(height),
+                   VISION_CAMERA_FPS=str(fps), PYTHONUNBUFFERED="1")
+        # stderr is inherited on purpose: the worker's "[camera] trying
+        # 640x480@30+depth" steps then land in the server's stderr, which is
+        # where anyone debugging a camera fault already looks.
+        self._proc = subprocess.Popen(
+            [sys.executable, worker], stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE, bufsize=0, cwd=here, env=env)
+        self._fd = self._proc.stdout.fileno()
+        self._buf = bytearray()
+        try:
+            hello = json.loads(
+                self._read_line(time.monotonic() + self.OPEN_TIMEOUT_S))
+            if not hello.get("ok"):
+                raise RuntimeError(hello.get("error", "camera worker failed"))
+        except BaseException:
+            self._terminate()
+            raise
+        self.name = f"{hello['name']} [out-of-process]"
+
+    # -- wire helpers --------------------------------------------------
+    def _fill(self, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                "The camera worker stopped answering (timed out). "
+                "stop_tracking, then retry; if it persists, unplug and "
+                "replug the D435.")
+        if select.select([self._fd], [], [], remaining)[0]:
+            chunk = os.read(self._fd, 1 << 16)
+            if not chunk:
+                raise self._worker_died()
+            self._buf += chunk
+
+    def _read_line(self, deadline: float) -> bytes:
+        while b"\n" not in self._buf:
+            self._fill(deadline)
+        line, _, rest = bytes(self._buf).partition(b"\n")
+        self._buf = bytearray(rest)
+        return line
+
+    def _read_exact(self, n: int, deadline: float) -> bytes:
+        while len(self._buf) < n:
+            self._fill(deadline)
+        out, self._buf = bytes(self._buf[:n]), self._buf[n:]
+        return out
+
+    def _send(self, request: str) -> None:
+        try:
+            self._proc.stdin.write(request.encode() + b"\n")
+            self._proc.stdin.flush()
+        except (BrokenPipeError, OSError, ValueError) as exc:
+            raise self._worker_died() from exc
+
+    def _worker_died(self) -> RuntimeError:
+        """The error to raise once the worker's pipe is gone."""
+        code = self._proc.poll()
+        if code is None:
+            try:
+                code = self._proc.wait(timeout=2.0)  # may still be exiting
+            except subprocess.TimeoutExpired:
+                code = None
+        if code is not None and code < 0:
+            try:
+                named = signal.Signals(-code).name
+            except ValueError:      # a signal number Python does not name
+                named = f"signal {-code}"
+            crash = ""
+            if -code == signal.SIGSEGV:
+                crash = (" -- the known librealsense/libusb segfault in "
+                         "usb_context()")
+            return RuntimeError(
+                f"The camera worker was killed by {named}{crash}. The robot "
+                "is unaffected and motion tools still work. The D435 usually "
+                "needs an unplug/replug into a USB3 port (no hub) before it "
+                "will stream again.")
+        return RuntimeError(
+            f"The camera worker exited (status {code}) without answering. "
+            "Its [camera] log lines on stderr say how far it got.")
+
+    def _terminate(self) -> None:
+        for stream in (self._proc.stdin, self._proc.stdout):
+            try:
+                stream.close()
+            except Exception:
+                pass
+        if self._proc.poll() is None:
+            self._proc.kill()
+            try:
+                self._proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # -- Camera interface ----------------------------------------------
+    def read(self, timeout_ms: int = 2000) -> Frame:
+        deadline = time.monotonic() + timeout_ms / 1000.0 + self.READ_GRACE_S
+        self._send(f"READ {int(timeout_ms)}")
+        head = json.loads(self._read_line(deadline))
+        if not head.get("ok"):
+            raise RuntimeError(head.get("error", "camera read failed"))
+        h, w = int(head["h"]), int(head["w"])
+        # .copy() because frombuffer is read-only and the detector and the
+        # viewer both draw on the image they are handed.
+        color = np.frombuffer(
+            self._read_exact(int(head["color_bytes"]), deadline),
+            np.uint8).reshape(h, w, 3).copy()
+        depth = None
+        if head["depth_bytes"]:
+            depth = np.frombuffer(
+                self._read_exact(int(head["depth_bytes"]), deadline),
+                np.float32).reshape(h, w).copy()
+        return Frame(color=color, depth_m=depth,
+                     fx=float(head["fx"]), fy=float(head["fy"]),
+                     cx=float(head["cx"]), cy=float(head["cy"]),
+                     t=time.monotonic())
+
+    def close(self) -> None:
+        if self._proc.poll() is None:
+            try:
+                self._send("CLOSE")  # lets it stop() the pipeline cleanly
+                self._proc.wait(timeout=5.0)
+            except (RuntimeError, subprocess.TimeoutExpired):
+                pass
+        self._terminate()
+
+
 class WebcamCamera:
     """Any UVC camera through OpenCV. Color only -- no depth.
 
@@ -307,6 +476,20 @@ class WebcamCamera:
         self._cap.release()
 
 
+def _open_realsense(width: int = 640, height: int = 480, fps: int = 30):
+    """Open the D435, out-of-process unless VISION_CAMERA_SUBPROCESS=off.
+
+    The escape hatch exists for debugging (a traceback is easier to read
+    when the camera runs in your own process) and for camera_worker.py
+    itself, which is already the child -- everything else wants the
+    isolation, because librealsense crashes natively. See SubprocessCamera.
+    """
+    if os.environ.get("VISION_CAMERA_SUBPROCESS",
+                      "on").lower() in ("off", "0", "false"):
+        return RealSenseCamera(width, height, fps)
+    return SubprocessCamera(width, height, fps)
+
+
 def open_camera(prefer: str = "auto", webcam_index: int = 0):
     """Open the best available camera.
 
@@ -319,7 +502,7 @@ def open_camera(prefer: str = "auto", webcam_index: int = 0):
         raise ValueError(f"Unknown camera preference {prefer!r}.")
     if prefer in ("auto", "realsense"):
         try:
-            cam = RealSenseCamera()
+            cam = _open_realsense()
             print(f"[camera] {cam.name}")
             return cam
         except RuntimeError as exc:
