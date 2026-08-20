@@ -31,9 +31,11 @@ from evaluator import ReachedPose
 DEFAULT_SERVER = f'{shlex.quote(sys.executable)} {shlex.quote(os.path.join(os.path.dirname(__file__), "..", "case 1", "server.py"))}'
 
 # UR10 home pose used by the --goal-home convenience evaluator (TCP xyz, metres).
-# Measured on the PolyScope X UR10 sim at home joints [0, -90, 0, -90, 0, 0] deg.
-# If your robot has a tool/TCP offset configured, re-measure and update this.
-HOME_TCP_XYZ = (0.0, -0.291, 1.485)
+# Forward kinematics of the PolyScope X UR10 sim at the kitchen home joints
+# [0, -90, 90, -90, -90, 0] deg (ur_client.HOME_Q_RAD). A UR5e's shorter links
+# put its home TCP elsewhere; likewise if a tool/TCP offset is configured --
+# re-measure and update this.
+HOME_TCP_XYZ = (-0.691, -0.174, 0.677)
 
 
 def main() -> None:

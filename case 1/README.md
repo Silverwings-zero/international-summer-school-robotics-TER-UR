@@ -182,3 +182,72 @@ interfaces over plain TCP sockets:
 
 Keep tools calling `URClient` methods so the server stays portable between the
 simulator and a real robot. Only `UR_HOST` changes.
+
+## Real robot (UR5e)
+
+The same MCP servers drive a real arm -- only configuration changes. The
+safety layer is model-aware: `UR_MODEL` selects the DH table, reach, and
+workspace box the checks run against (`ur10e` = the simulator default,
+`ur5e`, `ur5`). Never drive a UR5e with the ur10e default: every geometric
+safety check would assume an arm twice the size.
+
+1. **Preflight.** With the robot powered on and this machine on its network:
+
+       ../.venv/bin/python preflight_real_robot.py <robot-ip>
+
+   It checks the controller ports, PolyScope version, safety state, Remote
+   Control mode (e-Series ignores external URScript without it: Settings >
+   System > Remote Control, then the Local/Remote toggle), and does a full
+   RTDE state read. It never moves the robot.
+
+2. **Activate.** Fill the robot IP into `../mcp.real-robot.json` (and
+   `../run_vision_root.sh` for the case 4 camera servo), copy it over
+   `../.mcp.json`, restart Claude Code. The template also caps speeds well
+   below the simulator defaults (`UR_MAX_JOINT_SPEED` etc. -- env vars, no
+   code changes) for the first sessions around people.
+
+3. **First session.** Pendant speed slider at 25% or less, a hand on the
+   e-stop, nobody inside the reach envelope. Confirm payload + TCP on the
+   pendant match the mounted tool. Start with `get_robot_state`, then a
+   small `move_joints_relative`, before anything Cartesian.
+
+Flip back to the simulator by restoring `.mcp.json` (git checkout works).
+
+### Robotiq gripper (Hand-E)
+
+This cell's gripper is a **Robotiq Hand-E** (50 mm stroke, 20-185 N). It is
+driven through the Robotiq URCap's command server (port 63352 on the
+controller; `robotiq_gripper.py`, pure stdlib -- `ROBOTIQ_MODEL` selects
+`hand-e`/`2f-85`/`2f-140` for the mm and newton conversions). The tools:
+
+| tool | does |
+| --- | --- |
+| `check_gripper` | probe + full status; re-probes every call, so plugging the gripper in later just works |
+| `activate_gripper` | one-time self-calibration after power-up (fingers sweep full travel -- keep them clear) |
+| `set_gripper` | open/close; with a Robotiq it reports `object_detected` (false after a close = the grasp missed) |
+| `set_gripper_position` | width + speed + force control, gentle defaults, blocks until arrival/contact |
+
+Without a Robotiq (the simulator) `set_gripper` falls back to digital
+output 0 and says so (`backend: "digital-out-fallback"`).
+
+Two things must be true on the real cell, and `preflight_real_robot.py`
+checks both: **Tool Output Voltage = 24 V** (Installation > General > Tool
+I/O -- at 0 V the gripper is unpowered and nothing works) and the **Robotiq
+URCap running** (port 63352 accepts a connection). A URCap that connects but
+answers `STA ?` is running yet cannot reach the gripper -- that is a
+`GripperNotRespondingError`, and tool power is the usual cause.
+
+`test_robotiq_gripper.py` exercises the driver against a fake URCap
+(activation, contact detection, reply framing, concurrent commands, the
+`?` reply) and needs no robot and no gripper:
+
+    ../.venv/bin/python test_robotiq_gripper.py
+
+### Home pose
+
+`HOME_Q_RAD` is the kitchen home `[0, -90, +90, -90, -90, 0]` deg: upper arm
+vertical, forearm horizontal, tool pointing straight down -- the wrist
+camera overlooks the table, and wrist2 at -90 keeps linear moves possible
+straight from home. `move_robot_to_position` with no arguments goes there;
+case 4's `go_view_pose` uses the same pose (override per cell via
+`VISION_VIEW_Q_DEG` in `../run_vision_root.sh`).

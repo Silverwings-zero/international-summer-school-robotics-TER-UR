@@ -1,0 +1,28 @@
+# Case 1, voice layer. OPTIONAL: server.py does not import any of this, and
+# runs perfectly well with none of it installed.
+#
+#   pip install -r voice/requirements.txt
+#
+# System package needed first on Debian/Ubuntu (sounddevice binds PortAudio):
+#   sudo apt install -y libportaudio2
+
+# --- speech in ------------------------------------------------------------ #
+faster-whisper>=1.0   # Whisper on CTranslate2. int8 on CPU: ~150 MB RAM,
+                      # roughly real-time for the 'base' model.
+sounddevice>=0.4.6    # microphone capture via PortAudio, no PyAudio build step
+numpy>=1.24           # the audio buffer format both of the above speak
+
+# --- speech out ----------------------------------------------------------- #
+edge-tts>=6.1         # Microsoft neural voices, free, no API key. NEEDS INTERNET.
+pygame>=2.5           # decodes and plays the MP3 in-process (no ffmpeg needed)
+
+# --- talking to the model and to server.py -------------------------------- #
+mcp>=1.2              # MCP stdio client: launches server.py as a subprocess
+fastmcp>=2.0          # only for voice_mcp.py, the listen/speak MCP server.
+                      # Already required by ../server.py, so usually present.
+openai>=1.30          # only for --backend openai: OpenAI-compatible chat
+                      # client, configured with AGENT_BASE_URL /
+                      # AGENT_API_KEY / AGENT_MODEL. See ../../llm-client/
+claude-agent-sdk>=0.2 # only for --backend claude (the default): Claude Code as
+                      # a library. Uses the `claude` CLI login, so it draws on
+                      # your Claude subscription and needs NO API key.

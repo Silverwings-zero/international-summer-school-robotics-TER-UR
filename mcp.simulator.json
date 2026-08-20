@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "ur-tools": {
+      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
+      "args": [
+        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/server.py"
+      ]
+    },
+    "vision-tools": {
+      "command": "/usr/bin/sudo",
+      "args": [
+        "-n",
+        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/run_vision_root.sh"
+      ]
+    }
+  }
+}

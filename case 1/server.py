@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import signal
 import sys
@@ -41,6 +42,11 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from motion_patterns import PatternRunner, max_speed_for_radius
+from robotiq_gripper import (
+    HARDWARE_FAULTS,
+    GripperError,
+    RobotiqGripper,
+)
 from ur_client import (
     HOME_Q_RAD,
     JOINT_LIMIT,
@@ -120,11 +126,58 @@ SAFETY_STATUS_NAMES = {
 
 # The digital output a gripper listens on (tool IO convention; the simulator
 # has no physical gripper, so this drives the command line one would read).
+# On the real cell a Robotiq is driven through its URCap instead -- see
+# _robotiq() below; the pin stays as the simulator fallback.
 GRIPPER_PIN = 0
+
+# The Robotiq driver, connected lazily. None means "not found last time we
+# looked" -- and we look again on every gripper call, so plugging the gripper
+# in (or installing the URCap) later just works without a server restart.
+_GRIPPER_LOCK = threading.Lock()
+_ROBOTIQ: RobotiqGripper | None = None
+
+
+def _robotiq() -> RobotiqGripper | None:
+    """Return a live Robotiq driver, or None when no URCap answers."""
+    global _ROBOTIQ
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is not None:
+            return _ROBOTIQ
+    # Probe OUTSIDE the lock: when the controller is unreachable this blocks
+    # for the connect timeout, and holding the lock would serialize every
+    # gripper call (and get_robot_state) behind it.
+    candidate = RobotiqGripper(host=robot.host)
+    try:
+        candidate.connect()
+    except OSError:
+        return None
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is not None:
+            # Another thread won the race; keep its connection, drop ours.
+            winner = _ROBOTIQ
+            candidate.close()
+            return winner
+        _ROBOTIQ = candidate
+        return _ROBOTIQ
+
+
+def _drop_robotiq(failed: RobotiqGripper) -> None:
+    """Forget a dead connection so the next call re-probes from scratch.
+
+    Identity-aware: a late error from an old connection must not tear down
+    the healthy one that replaced it.
+    """
+    global _ROBOTIQ
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is failed:
+            _ROBOTIQ = None
+    failed.close()
 
 
 # =========================================================================== #
 # DIAMOND SAFETY LAYER  --  every motion tool funnels through these checks
+# (geometry comes from the UR_MODEL table below; the ur10e row is verified
+# to match the simulator's TCP to the millimetre)
 # BEFORE anything moves. A forward-kinematics model (UR10e DH parameters,
 # verified to match the simulator's TCP to the millimetre) predicts where a
 # joint target puts the whole arm, so unsafe commands are rejected with a
@@ -133,26 +186,65 @@ GRIPPER_PIN = 0
 
 # Command caps. Joint units rad/s, rad/s^2 (UR10e's slowest joints allow
 # 2.09 rad/s); TCP units m/s, m/s^2.
-MAX_JOINT_SPEED = 2.0
-MAX_JOINT_ACCEL = 4.0
-MAX_TCP_SPEED = 1.0
-MAX_TCP_ACCEL = 2.5
+# Dynamics caps. Overridable per cell (e.g. gentler for a real arm around
+# people) without touching code: UR_MAX_JOINT_SPEED etc.
+MAX_JOINT_SPEED = float(os.environ.get("UR_MAX_JOINT_SPEED", "2.0"))
+MAX_JOINT_ACCEL = float(os.environ.get("UR_MAX_JOINT_ACCEL", "4.0"))
+MAX_TCP_SPEED = float(os.environ.get("UR_MAX_TCP_SPEED", "1.0"))
+MAX_TCP_ACCEL = float(os.environ.get("UR_MAX_TCP_ACCEL", "2.5"))
+
+# The safety layer computes forward kinematics, reach, and workspace bounds
+# from the robot's geometry, so it must know WHICH arm it is guarding.
+# UR_MODEL selects a row; the default matches the PolyScope X simulator
+# (a UR10e). Set UR_MODEL=ur5e (or ur5) when driving the real arm.
+# DH values (a, d) are UR's published standard-DH tables; reach_m is the
+# kinematic maximum from the shoulder point, wrist offsets included;
+# workspace_m boxes the tool tip in the base frame.
+_UR_MODELS = {
+    "ur10e": {
+        "dh_a": (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0),
+        "dh_d": (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655),
+        "reach_m": 1.37,
+        "payload_kg": 12.5,
+        "workspace_m": {"x": (-1.30, 1.30), "y": (-1.30, 1.30),
+                        "z": (0.02, 1.60)},
+    },
+    "ur5e": {
+        "dh_a": (0.0, -0.425, -0.3922, 0.0, 0.0, 0.0),
+        "dh_d": (0.1625, 0.0, 0.0, 0.1333, 0.0997, 0.0996),
+        "reach_m": 0.95,
+        "payload_kg": 5.0,
+        "workspace_m": {"x": (-0.95, 0.95), "y": (-0.95, 0.95),
+                        "z": (0.02, 1.20)},
+    },
+    "ur5": {  # CB-series UR5
+        "dh_a": (0.0, -0.425, -0.39225, 0.0, 0.0, 0.0),
+        "dh_d": (0.089159, 0.0, 0.0, 0.10915, 0.09465, 0.0823),
+        "reach_m": 0.92,
+        "payload_kg": 5.0,
+        "workspace_m": {"x": (-0.92, 0.92), "y": (-0.92, 0.92),
+                        "z": (0.02, 1.05)},
+    },
+}
+UR_MODEL = os.environ.get("UR_MODEL", "ur10e").strip().lower()
+if UR_MODEL not in _UR_MODELS:
+    raise SystemExit(
+        f"Unknown UR_MODEL '{UR_MODEL}'; pick one of {sorted(_UR_MODELS)}")
+_MODEL = _UR_MODELS[UR_MODEL]
 
 # Safe workspace for the tool, base frame, metres. The tool tip may work down
 # to FLOOR_Z_M; the arm's joint origins (thick links, ~5 cm radius) must keep
 # the larger ARM_CLEARANCE_M so the physical link never touches the table even
 # though the check runs on the centreline.
-WORKSPACE_M = {"x": (-1.30, 1.30), "y": (-1.30, 1.30), "z": (0.02, 1.60)}
+WORKSPACE_M = _MODEL["workspace_m"]
 FLOOR_Z_M = 0.02
 ARM_CLEARANCE_M = 0.08
-# Kinematic maximum distance from the shoulder point (~1.364 m, wrist offsets
-# included). A Cartesian target beyond this can never be reached and would
-# only make movel stall until timeout.
-REACH_M = 1.37
+# A Cartesian target beyond this can never be reached and would only make
+# movel stall until timeout.
+REACH_M = _MODEL["reach_m"]
 
-# UR10e standard DH parameters (a, d, alpha), from UR's published table.
-_DH_A = (0.0, -0.6127, -0.57155, 0.0, 0.0, 0.0)
-_DH_D = (0.1807, 0.0, 0.0, 0.17415, 0.11985, 0.11655)
+_DH_A = _MODEL["dh_a"]
+_DH_D = _MODEL["dh_d"]
 _DH_ALPHA = (math.pi / 2, 0.0, 0.0, math.pi / 2, -math.pi / 2, 0.0)
 
 # Which frame origin sits where on the arm, for readable error messages.
@@ -162,7 +254,13 @@ _FRAME_NAMES = ("shoulder", "elbow", "wrist1", "wrist2", "wrist3", "tool")
 _TRAJECTORY_JOBS_LOCK = threading.Lock()
 _TRAJECTORY_JOBS: dict[str, "TrajectoryJob"] = {}
 _MAX_STORED_PROGRESS_SAMPLES = 500
-_WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name("waypoints_lookup_table.json")
+# Stored poses are only meaningful for the arm they were taught on, so every
+# non-simulator model gets its own bank file; the legacy unsuffixed file
+# belongs to the ur10e simulator it was recorded on.
+_WAYPOINT_LOOKUP_TABLE_PATH = Path(__file__).with_name(
+    "waypoints_lookup_table.json"
+    if os.environ.get("UR_MODEL", "ur10e").strip().lower() == "ur10e"
+    else f"waypoints_lookup_table.{os.environ.get('UR_MODEL').strip().lower()}.json")
 _WAYPOINT_BANK_LOCK = threading.Lock()
 
 
@@ -557,7 +655,7 @@ def _check_flange_above_table(position: list[float],
     """Reject a TCP pose whose ORIENTATION puts the wrist under the table.
 
     The box check sees only the tool point; with the tool z-axis pointing up,
-    the wrist flange sits d6 = 0.117 m BELOW the TCP and can pass through the
+    the wrist flange sits d6 (the active model's wrist offset, _DH_D[5]) BELOW the TCP and can pass through the
     table while the TCP itself stays legal. The flange point needs no inverse
     kinematics: it is TCP - d6 * (tool z-axis in base frame).
     """
@@ -587,8 +685,9 @@ def move_robot_to_position(
 
     Give six target joint angles in degrees, ordered base, shoulder, elbow,
     wrist1, wrist2, wrist3. Omit them to send the robot to its HOME position
-    ([0, -90, 0, -90, 0, 0] degrees) -- "move the robot home" is a call with no
-    arguments.
+    ([0, -90, 90, -90, -90, 0] degrees: upper arm vertical, forearm
+    horizontal, tool pointing straight down, so the wrist camera overlooks
+    the table) -- "move the robot home" is a call with no arguments.
 
     The move blocks until the robot arrives (the wait budget adapts to the
     distance and speed), then returns the new robot state (so you can observe
@@ -670,10 +769,31 @@ def get_robot_state() -> dict:
         ``ready_to_move``: True only when the mode is RUNNING and the safety
             status is NORMAL, so motion commands will be accepted.
         ``moving``: True while any joint is still in motion.
-        ``gripper_closed``: the commanded gripper state (digital output).
+        ``gripper_closed``: the COMMANDED gripper state (a Robotiq holding a
+            slim object sits mid-travel but still reads closed).
+        ``gripper_holding``: True when the Robotiq's fingers stopped on an
+            object, False when they reached the commanded position freely,
+            None when no Robotiq is connected (no contact sensing).
     """
     # 4. Execute (a read), then report in human units.
     state = robot.get_state()
+    # Both backends report the COMMANDED state, so the meaning of
+    # gripper_closed does not change with the hardware: on a Robotiq that is
+    # the requested position (PRE), not the actual one -- fingers holding a
+    # 30 mm cup sit mid-travel and must still read as "closed". Whether
+    # something is actually held is a separate flag. Only an
+    # already-connected Robotiq is consulted, so the state-read path never
+    # pays for a probe.
+    gripper_closed = bool(state.digital_out >> GRIPPER_PIN & 1)
+    gripper_holding: bool | None = None
+    robotiq = _ROBOTIQ
+    if robotiq is not None:
+        try:
+            gripper_closed = robotiq.get("PRE") > 128
+            gripper_holding = robotiq.get("OBJ") in (1, 2)
+        except (OSError, GripperError):
+            _drop_robotiq(robotiq)
+            gripper_holding = None
     return {
         "joints_deg": {n: round(math.degrees(q), 2)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
@@ -687,7 +807,8 @@ def get_robot_state() -> dict:
         "ready_to_move": (state.robot_mode == ROBOT_MODE_RUNNING
                           and state.safety_status == 1),
         "moving": state.is_moving,
-        "gripper_closed": bool(state.digital_out >> GRIPPER_PIN & 1),
+        "gripper_closed": gripper_closed,
+        "gripper_holding": gripper_holding,
     }
 
 
@@ -776,7 +897,8 @@ def move_linear(
     Use this when the path matters, not just the destination: approaching,
     inserting, drawing -- the tool tip travels a straight line in space
     (a joint move would sweep an arc). Position is [x, y, z] in metres in the
-    robot's base frame; for scale, home is [0, -0.29, 1.48].
+    robot's base frame; for scale, the upright HOME pose puts the tool at
+    z = 1.48 m on the UR10e simulator and z = 1.08 m on a UR5e.
 
     Caution: linear motion is impossible from a singular configuration and
     such calls are rejected up front -- if the arm is fully stretched (elbow
@@ -1002,37 +1124,223 @@ def _freedrive_worker():
         _FREEDRIVE_ACTIVE = False
 
 # =========================================================================== #
-# DIAMOND TOOL  --  gripper via digital IO. The simulator has no physical
-# gripper; this drives the digital output a real one (tool IO) would follow,
-# and reads the commanded state back over RTDE so the report is ground truth.
+# DIAMOND TOOLS  --  gripper. On the real cell a Robotiq 2F is driven through
+# its URCap command server (port 63352 on the controller) with real position,
+# speed, force, and object-detection feedback. The simulator has no gripper,
+# so there the tools fall back to the digital-output convention and say so.
 # =========================================================================== #
+@mcp.tool
+def check_gripper() -> dict:
+    """Detect the gripper and report its state. Never moves anything.
+
+    Call this after (re)connecting hardware, and before the first grasp of a
+    session. It probes the Robotiq URCap port on the controller: when a
+    Robotiq answers, the report includes activation, position, and fault
+    state, plus the next step to take (``activate_gripper`` if it is not
+    yet activated). When nothing answers, gripper commands fall back to
+    driving digital output pin 0 -- the simulator convention, with no
+    force or object feedback.
+
+    Returns:
+        A dict with ``connected`` (a Robotiq answered), ``backend``
+        ("robotiq" or "digital-out-fallback"), and, for a live Robotiq,
+        its full status and a ``next_step`` hint.
+    """
+    gripper = _robotiq()
+    if gripper is None:
+        report = {
+            "connected": False,
+            "backend": "digital-out-fallback",
+            "detail": (
+                f"No Robotiq URCap answering on {robot.host}:63352. On the "
+                "simulator this is normal. On the real robot the URCap is "
+                "the only network path to the gripper: install/enable the "
+                "Robotiq Grippers URCap on the pendant (Settings > System > "
+                "URCaps), then call this again."),
+        }
+        # An unpowered tool connector is the other common reason a mounted
+        # gripper is silent, and it is worth reporting before the operator
+        # goes hunting through URCap menus.
+        try:
+            power = robot.get_tool_power()
+            report["tool_power"] = {
+                "voltage_v": power.voltage_v,
+                "current_a": round(power.current_a, 3),
+                "interface": power.tool_mode_name,
+                "powered": power.powered,
+            }
+            if not power.powered:
+                report["next_step"] = (
+                    "The tool connector is supplying 0 V, so a mounted "
+                    "gripper has no power at all. Set Tool Output Voltage to "
+                    "24 V (pendant: Installation > General > Tool I/O, or "
+                    "the set_tool_voltage tool) before debugging further.")
+        except Exception:  # noqa: BLE001 - diagnostics must never fail the tool
+            pass
+        return report
+    try:
+        status = gripper.status()
+    except (OSError, GripperError) as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(
+            f"A gripper port answered but the status read failed: {exc}. "
+            "Retry check_gripper; if it keeps failing, power-cycle the "
+            "gripper.") from exc
+    report = {"connected": True, "backend": "robotiq", **status.as_dict()}
+    # A hardware fault outranks "not activated": an unplugged gripper is
+    # BOTH, and telling the operator to activate it just wastes their time.
+    if status.fault in HARDWARE_FAULTS:
+        report["next_step"] = (
+            f"Gripper reports {status.fault_name}: the URCap is running but "
+            "the gripper itself is not answering. Check the tool cable and "
+            "that the tool connector supplies 24 V, then call this again.")
+    elif status.fault:
+        report["next_step"] = (
+            f"Gripper reports fault {status.fault_name}; power-cycle the "
+            "gripper or re-run activate_gripper.")
+    elif not status.activated:
+        report["next_step"] = (
+            "Gripper is not activated. Clear the space in front of the "
+            "fingers (they sweep full travel to self-calibrate) and call "
+            "activate_gripper.")
+    return report
+
+
+@mcp.tool
+def activate_gripper() -> dict:
+    """Run the Robotiq activation cycle and wait until it is ready.
+
+    A Robotiq must be activated once after each power-up before it accepts
+    motion commands. Activation sweeps the fingers through their FULL travel
+    to self-calibrate -- make sure nothing (and nobody) is between them.
+    Already-activated grippers return immediately, so this is always safe
+    to call before a grasping task.
+
+    Returns:
+        The gripper status dict after activation (``activated`` true).
+
+    Raises:
+        ValueError: No Robotiq is connected (nothing to activate).
+        RuntimeError: Activation failed or timed out.
+    """
+    gripper = _robotiq()
+    if gripper is None:
+        raise ValueError(
+            f"No Robotiq URCap answering on {robot.host}:63352 -- nothing "
+            "to activate. Run check_gripper for diagnostics.")
+    try:
+        status = gripper.activate()
+    except GripperError as exc:
+        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
+    except OSError as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
+    return {"backend": "robotiq", **status.as_dict()}
+
+
+@mcp.tool
+def set_gripper_position(position_pct: float, speed_pct: float = 50.0,
+                         force_pct: float = 25.0) -> dict:
+    """Move the gripper fingers to a width, with speed and force control.
+
+    Use this instead of ``set_gripper`` when the opening matters: pre-opening
+    just wider than an object, or closing gently around something soft.
+    Blocks until the fingers arrive or stop on contact, so the returned
+    ``object_detected`` is trustworthy. Defaults are gentle on purpose --
+    this cell works alongside people.
+
+    Args:
+        position_pct: Target closure, 0 = fully open .. 100 = fully closed.
+        speed_pct: Finger speed, 0 (slowest) .. 100 (fastest).
+        force_pct: Grip force limit, 0 (lightest) .. 100 (strongest).
+
+    Returns:
+        The gripper status dict: ``position_pct`` and ``opening_mm``
+        actually reached, ``object_detected`` (fingers stopped early on
+        something), and the ``model`` the mm figure assumes.
+
+    Raises:
+        ValueError: Argument out of range, no Robotiq connected, or the
+            gripper is not activated yet.
+        RuntimeError: The gripper stopped answering mid-move.
+    """
+    # 1. Validate ranges before touching hardware.
+    for name, value in (("position_pct", position_pct),
+                        ("speed_pct", speed_pct), ("force_pct", force_pct)):
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"{name} must be within 0..100, got {value}.")
+    gripper = _robotiq()
+    if gripper is None:
+        raise ValueError(
+            "Position control needs a Robotiq (none is connected). For the "
+            "simulator's on/off gripper use set_gripper instead.")
+    # 2. Convert percentages to the gripper's 0..255 registers.
+    try:
+        status = gripper.move(
+            position=round(position_pct / 100.0 * 255),
+            speed=round(speed_pct / 100.0 * 255),
+            force=round(force_pct / 100.0 * 255),
+        )
+    except GripperError as exc:
+        raise ValueError(str(exc)) from exc
+    except OSError as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(
+            f"Lost the gripper connection mid-move: {exc}") from exc
+    return {"backend": "robotiq", **status.as_dict()}
+
+
 @mcp.tool
 def set_gripper(closed: bool) -> dict:
     """Open or close the gripper.
 
     Use ``closed=true`` to grip (before lifting an object) and
-    ``closed=false`` to release. The command drives the robot's gripper
-    digital output and confirms it by reading the IO state back from the
-    controller. Check ``get_robot_state``'s ``gripper_closed`` afterwards if
-    you need to re-verify during a longer task.
+    ``closed=false`` to release. With a Robotiq connected this closes at a
+    gentle default force and reports ``object_detected``: true means the
+    fingers stopped on something, so the grasp holds. False after a close
+    means they ran to the fully-closed stop -- usually a MISS, though a very
+    thin or soft item can also let them reach it, so confirm with
+    ``opening_mm`` (0 mm means nothing is between the fingers).
+    Without a Robotiq (the simulator) it falls back to driving the gripper
+    digital output and confirming it over RTDE. For finer control of width,
+    speed, or force use ``set_gripper_position``.
 
     Args:
         closed: True to close the gripper, False to open it.
 
     Returns:
-        A dict with ``gripper`` ("closed" or "open"), the gripper ``pin``
-        number, and ``pin_state`` (the confirmed digital-output level).
+        A dict with ``gripper`` ("closed" or "open") and ``backend``
+        ("robotiq": full status incl. ``object_detected``;
+        "digital-out-fallback": the ``pin`` and confirmed ``pin_state``).
 
     Raises:
-        RuntimeError: The robot is not powered on.
+        ValueError: The Robotiq is present but not activated yet.
+        RuntimeError: The robot is not powered on (fallback path), or the
+            gripper stopped answering.
         TimeoutError: The controller did not confirm the output change.
     """
-    # 1.-3. A boolean needs no validation, conversion, or limit checks.
-    # 4. Execute and report the state read back from the controller.
+    gripper = _robotiq()
+    if gripper is not None:
+        try:
+            status = gripper.move(position=255 if closed else 0)
+        except GripperError as exc:
+            raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            _drop_robotiq(gripper)
+            raise RuntimeError(
+                f"Lost the gripper connection mid-move: {exc}") from exc
+        return {
+            "gripper": "closed" if closed else "open",
+            "backend": "robotiq",
+            **status.as_dict(),
+        }
+    # Fallback: the simulator's digital-output convention, confirmed by
+    # reading the IO state back from the controller.
     state = robot.set_digital_out(GRIPPER_PIN, closed)
     confirmed = bool(state.digital_out >> GRIPPER_PIN & 1)
     return {
         "gripper": "closed" if confirmed else "open",
+        "backend": "digital-out-fallback",
         "pin": GRIPPER_PIN,
         "pin_state": confirmed,
     }
@@ -1066,7 +1374,7 @@ def set_tcp(tcp_pose_m_rad: list[float]) -> dict:
     }
 
 
-# Mass and cog is limited for UR10e 
+# Mass and CoG are limited by the selected UR_MODEL's rated payload.
 @mcp.tool
 def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
     """Set payload mass and center-of-gravity for commissioning checks.
@@ -1078,21 +1386,26 @@ def set_payload(mass_kg: float, cog_m: list[float] | None = None) -> dict:
     Returns:
         A dict confirming the payload mass and CoG that was applied.
     Raises:
-        ValueError: Negative mass, mass above 12.5 kg, or malformed CoG.
-        CoG Error: If the mass and CoG offset exceed the UR10e's payload limit.
-        
+        ValueError: Negative mass, mass above the selected model's rated
+            payload, malformed CoG, or a mass/CoG-offset combination beyond
+            the model's rating.
     """
+    limit = _MODEL["payload_kg"]
     if mass_kg < 0:
         raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
-    if mass_kg > 12.5:
-        raise ValueError(f"Payload mass of UR10 must be lower than 12.5kg, got  {mass_kg} kg.")
+    if mass_kg > limit:
+        raise ValueError(
+            f"Payload mass on a {UR_MODEL} must be at most {limit} kg, "
+            f"got {mass_kg} kg.")
     cog = [0.0, 0.0, 0.0] if cog_m is None else [float(v) for v in cog_m]
     if len(cog) != 3:
         raise ValueError(f"Expected cog_m as [x, y, z], got {len(cog)} values.")
     offset_distance = math.hypot(*cog)
     print(f"Payload mass: {mass_kg} kg, CoG offset distance: {offset_distance:.3f} m")
-    if (mass_kg * offset_distance) > 12.5:
-        raise ValueError(f"Invalid CoG. {mass_kg} kg cannot be offset by {offset_distance:.3f} m.")
+    if (mass_kg * offset_distance) > limit:
+        raise ValueError(
+            f"Invalid CoG for a {UR_MODEL}: {mass_kg} kg cannot be offset "
+            f"by {offset_distance:.3f} m.")
     body = (
         f"  set_payload({float(mass_kg):.6f}, "
         f"[{cog[0]:.6f}, {cog[1]:.6f}, {cog[2]:.6f}])\n"
@@ -1110,6 +1423,10 @@ def set_payload_mass(mass_kg: float) -> dict:
     """Set payload mass only (CoG unchanged by controller defaults)."""
     if mass_kg < 0:
         raise ValueError(f"Payload mass must be non-negative, got {mass_kg} kg.")
+    if mass_kg > _MODEL["payload_kg"]:
+        raise ValueError(
+            f"Payload mass on a {UR_MODEL} must be at most "
+            f"{_MODEL['payload_kg']} kg, got {mass_kg} kg.")
     body = f"  set_payload_mass({float(mass_kg):.6f})\n"
     robot.run_script(body)
     return {
@@ -1368,6 +1685,8 @@ def store_waypoint_pose_on_ur(
                 f"got {len(tcp_pose_m_rad)}."
             )
         values = [float(v) for v in tcp_pose_m_rad]
+        _check_reach(*values[:3], what="the pose being stored")
+        _check_flange_above_table(values[:3], values[3:])
     robot.define_pose_variable(name, values)
     _save_pose_to_waypoint_bank(name, values)
     return {
@@ -1453,6 +1772,32 @@ def move_to_stored_tcp_waypoint(
     _check_tcp_dynamics(speed, acceleration)
     if timeout_s <= 0:
         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+    # The controller resolves the variable, but the move must still pass the
+    # same geometric gate as move_linear -- a stored pose taught on a bigger
+    # arm (or another cell) would otherwise replay unchecked. The pose is
+    # looked up locally: first the waypoint bank, then the cached expression.
+    pose = None
+    bank = _load_waypoint_bank()
+    entry = bank.get("pose_variables", {}).get(name)
+    if isinstance(entry, list) and len(entry) == 6:
+        pose = [float(v) for v in entry]
+    elif isinstance(entry, dict) and isinstance(entry.get("value"), list):
+        pose = [float(v) for v in entry["value"]]
+    if pose is None:
+        expr = robot._cached_ur_variable_expr(name)
+        if expr and expr.startswith("p["):
+            try:
+                pose = [float(v) for v in expr[2:-1].split(",")]
+            except ValueError:
+                pose = None
+    if pose is None or len(pose) != 6:
+        raise ValueError(
+            f"'{name}' is not in the local waypoint bank, so its target "
+            "cannot be safety-checked before moving. Re-store it with "
+            "store_waypoint_pose_on_ur first.")
+    _check_reach(*pose[:3], what=f"stored waypoint '{name}'")
+    _check_flange_above_table(pose[:3], pose[3:])
 
     state = robot.move_linear_to_variable(
         name,

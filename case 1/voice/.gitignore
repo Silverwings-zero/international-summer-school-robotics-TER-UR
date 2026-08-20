@@ -1,0 +1,4 @@
+# Written at run time by run_voice.py (the MCP server's stderr).
+server.log
+__pycache__/
+*.log
