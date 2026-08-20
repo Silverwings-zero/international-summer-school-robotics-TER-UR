@@ -155,7 +155,7 @@ async def main() -> int:
             # Probe the SDK itself: claude_backend imports it lazily, so
             # importing that module alone would not catch a missing install
             # and the failure would surface later as a traceback.
-            import claude_agent_sdk  # noqa: F401
+            import claude_agent_sdk  # noqa:
 
             from claude_backend import ClaudeCodeAgent
         except ImportError:
