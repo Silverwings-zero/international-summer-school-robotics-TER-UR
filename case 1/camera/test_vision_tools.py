@@ -5,7 +5,8 @@ virtual cup and phone, and the REAL simulated robot moving under URSim's
 controller. Checks the language-level flow an LLM would drive:
 
     look -> place objects -> track_object("cup") -> LOCKED
-         -> descend_on("phone") -> LOCKED closer -> stop_tracking
+         -> track_object("phone", standoff_m=0.18) -> LOCKED closer
+         -> grasp_tracked_object(dry_run) -> stop_tracking
 
 Prereqs: the simulator is up and the robot is RUNNING, and the environment
 selects sim perception:
@@ -37,9 +38,8 @@ async def main() -> None:
 
     async with Client(mcp) as client:
         tools = {t.name for t in await client.list_tools()}
-        need = {"look", "track_object", "descend_on", "stop_tracking",
-                "tracking_status", "calibrate_hand_eye", "place_sim_object",
-                "show_camera_view", "hide_camera_view"}
+        need = {"look", "track_object", "stop_tracking", "tracking_status",
+                "grasp_tracked_object", "show_camera_view", "hide_camera_view"}
         assert need <= tools, f"missing tools: {need - tools}"
         print("tools:", ", ".join(sorted(tools)))
 
@@ -64,15 +64,13 @@ async def main() -> None:
             assert "No 'cup' in view" in str(exc), str(exc)
             print("track refuses empty scene:", str(exc).splitlines()[-1][:80])
 
-        # Drop a cup ahead-right of the camera, a phone ahead-left.
-        out = unpack(await client.call_tool("place_sim_object", {
-            "object_name": "cup", "forward_m": 0.50,
-            "right_m": 0.10, "down_m": 0.06}))
-        print("placed cup at", out["position_base_m"])
-        out = unpack(await client.call_tool("place_sim_object", {
-            "object_name": "cell phone", "forward_m": 0.55,
-            "right_m": -0.12, "down_m": 0.02}))
-        print("placed phone at", out["position_base_m"])
+        # Drop a cup ahead-right of the camera, a phone ahead-left. This is
+        # a test fixture, not an MCP tool -- place_sim_object was removed from
+        # the tool surface because the shipped config is always VISION_MODE=real.
+        p_cup = engine.perception.place_ahead("cup", 0.50, 0.10, 0.06)
+        print("placed cup at", [round(v, 4) for v in p_cup])
+        p_phone = engine.perception.place_ahead("cell phone", 0.55, -0.12, 0.02)
+        print("placed phone at", [round(v, 4) for v in p_phone])
 
         out = unpack(await client.call_tool("look", {}))
         names = {o["name"] for o in out["objects"]}
@@ -88,14 +86,32 @@ async def main() -> None:
         err = math.hypot(*st["offcenter_norm"])
         print(f"  cup centred: offcenter={err:.4f}, depth={st['depth_m']}m")
 
-        # "descend on the phone" -- swaps target AND closes in to 0.18 m.
-        st = unpack(await client.call_tool("descend_on", {
+        # "close in on the phone" -- swaps target AND tightens the standoff.
+        # (descend_on was removed: it was track_object with other defaults.)
+        st = unpack(await client.call_tool("track_object", {
             "object_name": "phone", "standoff_m": 0.18, "wait_s": 90}))
-        print("descend_on ->", st["state"])
+        print("track_object (close) ->", st["state"])
         assert st["locked"], f"never locked: {st}"
         assert abs(st["depth_m"] - 0.18) < 0.025, st
         print(f"  phone at {st['depth_m']}m, offcenter="
               f"{[round(v,4) for v in st['offcenter_norm']]}")
+
+        # The fixed pick routine: dry-run only, so the suite never closes a
+        # gripper or lifts. It must refuse when nothing is locked, and its
+        # plan must stay inside the blind-move cap.
+        plan = unpack(await client.call_tool("grasp_tracked_object",
+                                             {"dry_run": True}))
+        assert plan["status"] == "planned", plan
+        assert plan["correction_tool_m"] == [0.015, 0.0, 0.03], plan
+        assert math.dist(plan["correction_tool_m"], [0, 0, 0]) <= 0.06, plan
+        # At the home orientation tool +X is base +Y and tool +Z is base -Z,
+        # so the correction must read as "sideways in +Y, straight down".
+        base = plan["correction_base_m"]
+        assert abs(base[0]) < 1e-3 and abs(base[1] - 0.015) < 1e-3, base
+        assert abs(base[2] + 0.03) < 1e-3, base
+        # A dry run must leave the servo loop alone.
+        assert unpack(await client.call_tool("tracking_status", {}))["tracking"]
+        print("grasp plan:", base, "->", plan["grasp_pose"])
 
         st = unpack(await client.call_tool("stop_tracking", {}))
         assert not st["tracking"]
@@ -110,6 +126,13 @@ async def main() -> None:
                 raise AssertionError(f"accepted bad input {args}")
             except Exception as exc:
                 assert why in str(exc), (why, str(exc))
+        try:
+            await client.call_tool("grasp_tracked_object", {})
+            raise AssertionError("grasp_tracked_object ran without a lock")
+        except Exception as exc:
+            assert "Not locked" in str(exc), str(exc)
+            print("grasp refuses without a lock ok")
+
         print("input validation ok")
 
     tcp1 = engine.robot.get_tcp_pose()

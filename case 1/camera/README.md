@@ -28,7 +28,7 @@ everything new is vision.
 
 This folder is a subpackage of case 1, the sibling of `../voice/`: the same
 server owns motion and perception, and `../run_server.sh` starts both as one
-44-tool MCP. It was case 4 until the stack was consolidated; every path here
+37-tool MCP. It was case 4 until the stack was consolidated; every path here
 is relative, so the tree moves without edits.
 
 ## Setup
@@ -103,12 +103,10 @@ directly:
 | `look()` | every visible object: name, confidence, off-centre offset, distance |
 | `what_can_you_see()` | "what can you see?" -- the YOLO object list, grouped by name with counts and a plain-English summary |
 | `track_object("cup")` | centre it and hold the standoff; keeps following afterwards |
-| `descend_on("phone", standoff_m=0.15)` | same law, tight standoff: close in on it |
 | `stop_tracking()` | freeze; nothing moves until the next command; closes the live view |
 | `tracking_status()` | LOCKED?, current error, depth -- poll during long moves |
-| `calibrate_hand_eye()` | the 30 s probing calibration, saved across restarts |
+| `grasp_tracked_object()` | the fixed pick: correct the measured camera-to-fingertip offset, close, lift |
 | `show_camera_view()` / `hide_camera_view()` | open/close the live view without tracking |
-| `place_sim_object("cup", 0.5, 0.1, 0.05)` | sim mode only: put a virtual object in view |
 
 **Live view.** When tracking starts, a window pops up on the machine running
 the server: the camera image (or the simulated camera: grid + virtual
@@ -121,13 +119,13 @@ the robot. Set `VISION_VIEW=off` to disable auto-opening, `always` to open
 it at startup.
 
 Every command re-arms the safety box at the current pose, so each
-`track_object`/`descend_on` gets a fresh (but bounded) +-30 cm envelope.
+`track_object` call gets a fresh (but bounded) +-30 cm envelope.
 Servoing refuses to start -- and stops mid-flight -- near the wrist AND
 elbow singularities, where PolyScope X linear moves protective-stop with
 C204A1; the way out is case 1's `move_robot_to_position()` with no
 arguments, which goes to the same home/view pose.
 
-`VISION_MODE=sim` (the default in `.mcp.json`) needs no camera at all: virtual
+`VISION_MODE=sim` needs no camera at all: virtual
 objects are watched by a virtual wrist camera glued to the LIVE simulated TCP
 (read over one persistent RTDE stream), so the whole loop -- servo law,
 URScript moves, URSim's controller -- is real except the pixels. Set

@@ -4,7 +4,7 @@ This repo runs a UR arm as a **collaborative kitchen robot**. The user gives a
 general command ("pour milk into the coffee"); Claude plans it with the MCP
 tools below, narrates the plan, and executes it **step by step together with
 the user** — the robot does what it can, and asks the human for everything it
-cannot do. **One MCP server, `ur-tools`, provides every tool** (44 of them):
+cannot do. **One MCP server, `ur-tools`, provides every tool** (37 of them):
 
 - motion, gripper, waypoints, patterns, IO — `case 1/server.py`.
 - wrist-camera perception and visual servoing (look, track, descend) —
@@ -59,8 +59,9 @@ loop: listen → act → speak one short status sentence → listen again.
 
 - See the table from the home pose (YOLO object detection; class names are
   COCO-ish — a pen may detect as "baseball bat"; use `look` to learn names).
-- Visually track and approach an object: `track_object`, `descend_on`
-  (servoing stops at a standoff ≥ 0.10 m; it can never reach contact).
+- Visually track and approach an object: `track_object` (servoing stops
+  at a standoff ≥ 0.10 m; it can never reach contact), then close the last
+  measured centimetres with `grasp_tracked_object`.
 - Grasp **regular, rigid objects that fit between the open fingers** at the
   grasp point (pen, spoon handle, small cup rim): see "Auto-grasp
   procedure".
@@ -118,31 +119,40 @@ grasped by a narrower feature — rim, neck, handle — or handed over.
 
 ## Auto-grasp procedure (ability 1)
 
-For a regular, rigid object that fits between the open fingers:
+For a regular, rigid object that fits between the open fingers. The pick is a
+**fixed routine**, not a search: servoing centres the *camera* on the object,
+and `grasp_tracked_object` closes the known camera-to-fingertip gap measured
+for this cell (3 cm down, 1.5 cm sideways).
 
 1. `move_robot_to_position` (no arguments); `look` to confirm the object,
    its name, and `distance_m`.
 2. Select slow (`set_tool_digital_out(n=1, b=true)`) and open the gripper
-   (`set_tool_digital_out(n=0, b=true)`) before descending.
-3. `descend_on(object_name, standoff_m=0.12)`, wait for LOCK, then
-   `stop_tracking` to freeze. If servoing diverges: `calibrate_hand_eye`
-   with the object ~0.3 m from the camera, then retry.
-4. **Final approach.** The camera reports *camera-to-object* distance, and
-   the fingertips are not at the camera — so the descent distance is
-   `depth_m − CAMERA_TO_FINGERTIP_M − grasp_offset`, and
-   `CAMERA_TO_FINGERTIP_M` is a **taught constant for this cell that no tool
-   measures**. Until it has been taught and written here, do NOT compute a
-   blind descent: instead step down in ≤ 2 cm `move_linear` moves, re-reading
-   `look`/`get_robot_state` between steps, and stop as soon as the object
-   fills the view or the tool reaches the taught table height. If either is
-   unknown, ask the user to jog the last centimetres (freedrive) or hand the
-   object over.
-5. Close: `set_tool_digital_out(n=0, b=false)`. The robot cannot tell you
-   whether it worked — `look` again, or ask the user, before doing anything
-   else. If it missed, reopen, lift 5 cm, re-look, retry once, then fall
-   back to hand-over.
-6. Lift straight up ≥ 10 cm before any lateral move. Set `set_payload_mass`
-   to gripper + object mass when the object is heavier than ~0.5 kg.
+   (`set_tool_digital_out(n=0, b=true)`). **Open it before tracking** —
+   `grasp_tracked_object` never opens the jaws, because opening them over the
+   table would drop whatever is already held.
+3. `track_object(object_name, standoff_m=0.15)` and wait for **LOCKED**. If
+   servoing diverges or refuses near a singularity, `stop_tracking`, go home
+   with `move_robot_to_position`, and try again.
+4. `grasp_tracked_object()` **immediately** — it needs the lock to still be
+   live, and it only corrects a fixed offset from where the lock left the arm.
+   It freezes tracking, corrects 3 cm down the approach axis and 1.5 cm
+   sideways at 30 mm/s, closes the jaws, waits out their travel, then lifts
+   10 cm (`lift_m` changes that; `lift_m=0` grips without lifting).
+   `dry_run=true` reports the motion without moving — worth one call whenever
+   the camera or tool has been re-mounted.
+5. **Verify by looking.** The gripper reports nothing at all, so `status:
+   "gripped"` means the commands were sent, NOT that the object is held.
+   `look` again, or ask the user. If it missed: reopen, `move_robot_to_position`,
+   re-look, retry once, then fall back to hand-over.
+6. Set `set_payload_mass` to gripper + object mass when the object is heavier
+   than ~0.5 kg.
+
+The offset is one cell constant at the top of `case 1/camera/vision_tools.py`:
+`GRASP_CORRECTION_TOOL_M = (0.015, 0.0, 0.030)`, in the TOOL frame — sideways
+in +X, down the approach axis in +Z. At the home orientation that comes out as
+1.5 cm along base +Y and 3 cm straight down, i.e. 1.5 cm to the LEFT of someone
+standing in front of the robot. Re-measure it if the camera or the gripper is
+re-mounted; nothing measures it automatically.
 
 ## Hand-over protocol (ability 2)
 
@@ -207,13 +217,15 @@ camera viewer's `v` key agrees with it.
    gripper lines.
 4. `.mcp.json` = mcp.real-robot.json; restart the MCP client. One server
    named `ur-tools` should appear, carrying the camera tools too; if `look`
-   is missing, read its stderr for `vision unavailable`.
+   is missing, read its stderr for `camera unavailable`.
 5. `get_robot_state` → RUNNING/NORMAL, and `gripper_open` / `gripper_speed`
    show the two tool lines. Exercise the gripper once with
    `set_tool_digital_out` (slow first, then open/close) with the fingers
    clear.
-6. First session after re-mounting the camera: place an object ~0.3 m below
-   the camera and run `calibrate_hand_eye` (it refuses beyond ~0.5 m —
-   image response too small).
+6. First session after re-mounting the camera or the gripper: re-measure the
+   grasp offsets (see "Auto-grasp procedure") and check them with
+   `grasp_tracked_object(dry_run=true)`. The hand-eye mount calibration in
+   `case 1/camera/hand_eye.json` is loaded at startup; re-measuring it now
+   needs the standalone viewer (`python "case 1/camera/servo.py"`, `c` key).
 7. Verify home: `move_robot_to_position` (no arguments), then
    `what_can_you_see` shows the table.

@@ -740,9 +740,11 @@ def get_robot_state() -> dict:
     Returns:
         A dict with the full snapshot:
         ``joints_deg`` / ``joints_rad``: per-joint angles, base..wrist3, in
-            degrees and in the controller's native radians. Radians are what
-            the waypoint bank and every URScript pose store, so copy those
-            when handing a taught pose back to the robot.
+            degrees and in the controller's native radians. EVERY tool here
+            takes DEGREES -- feed ``joints_deg`` back to move_robot_to_position
+            and friends. ``joints_rad`` is for reading only: it is the raw
+            controller value, and it is the unit the waypoint bank and
+            URScript poses store.
         ``tcp_pose_m_rad``: tool pose [x, y, z, rx, ry, rz] in the base frame,
             metres and radians (axis-angle rotation).
         ``robot_mode`` / ``robot_mode_name``: controller mode; 7 (RUNNING)
@@ -1447,11 +1449,13 @@ def stop_freedrive_mode() -> dict:
     moving on. Calling it when freedrive is not running is harmless.
 
     Returns:
-        A dict with ``status`` -- ``stopped`` (freedrive ended, ``mode``
-        back to ``normal``) or ``not_active`` (it was not running).
-
-    Raises:
-        RuntimeError: The controller did not accept the end-freedrive script.
+        A dict with ``status``:
+        ``stopped`` -- freedrive ended, ``mode`` back to ``normal``;
+        ``not_active`` -- it was not running, nothing to do;
+        ``error`` -- the controller did not accept the end-freedrive script.
+        This tool does NOT raise on that failure, so check the status: on
+        ``error`` the arm may still be compliant. Read ``get_robot_state``
+        and retry before commanding any motion.
     """
     global _FREEDRIVE_ACTIVE
     if not _FREEDRIVE_ACTIVE:
@@ -1460,8 +1464,9 @@ def stop_freedrive_mode() -> dict:
         robot.run_script("  end_freedrive_mode()\n", timeout_s=5.0)
         _FREEDRIVE_ACTIVE = False
         return {"status": "stopped", "mode": "normal"}
-    except:
-        return {"status": "error", "mode": "freedrive", "message": "Failed to stop freedrive mode."}
+    except Exception as exc:  # noqa: BLE001 - reported, not raised (see docstring)
+        return {"status": "error", "mode": "freedrive",
+                "message": f"Failed to stop freedrive mode: {exc}"}
 
 
 
