@@ -81,7 +81,7 @@ class URClient:
             ``127.0.0.1`` (the simulator's published address on your machine).
     """
 
-    host: str = field(default_factory=lambda: os.environ.get("UR_HOST", "127.0.0.1"))
+    host: str = field(default_factory=lambda: os.environ.get("UR_HOST", "192.168.1.100"))
     _ur_variable_expr: dict[str, str] = field(default_factory=dict,
                                                init=False, repr=False)
     _ur_variable_lock: threading.Lock = field(default_factory=threading.Lock,
