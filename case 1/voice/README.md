@@ -145,6 +145,7 @@ python voice/run_voice.py --text          # type instead of speaking (no mic)
 python voice/run_voice.py --tts none      # print replies instead of speaking
 python voice/run_voice.py --list-devices  # find your microphone's index
 python voice/run_voice.py --quiet         # hide tool calls, cleaner for a demo
+python voice/run_voice.py --progress none # no spoken commentary, answer only
 python voice/run_voice.py --input-device 7   # force a microphone by index
 python voice/run_voice.py --language it --voice it-IT-DiegoNeural  # another language
 ```
@@ -160,6 +161,36 @@ audio from the picture entirely while keeping the identical tool loop.
 | `!` then `ENTER` | **stop the robot now** — calls `pause_motion` directly, no model in the path |
 | `q` then `ENTER` | quit (leaves the robot as it is) |
 | `Ctrl-C` | stop the robot, then exit |
+
+### While it is working
+
+One request often becomes several tool calls — check the state, move, confirm —
+and that takes ten to twenty seconds. The assistant does not wait in silence
+for it: it speaks as it goes.
+
+```
+you> put the pan on the hob
+robot> Let me check where the arm is first.      <- the model's own sentence
+robot> Moving the arm.                           <- a line for the tool call
+robot> One moment.                               <- the arm is still moving
+robot> The pan is on the hob.                    <- the answer
+```
+
+Three sources, in that order of preference:
+
+1. **What the model wrote.** Claude usually narrates before it acts. That
+   sentence is already the right progress message, so it is spoken rather than
+   replaced by something invented.
+2. **The tool being called**, when the model goes straight to it without
+   commentary — `TOOL_PHRASES` in `progress.py` maps `move_linear` to *"Moving
+   the arm."* and so on.
+3. **A filler**, if a single call blocks for longer than `--heartbeat` seconds
+   (9 by default). This is the one that covers a slow trajectory.
+
+`--progress print` shows the commentary on screen but keeps the voice for the
+answer alone; `--progress none` restores the old behaviour. Only one line is
+ever queued, and the answer discards it — speech is slower than tool calls, so
+a queue would end up narrating a move that finished ten seconds ago.
 
 ### Things to try
 
@@ -266,6 +297,8 @@ note it is the only one of the two with a stop key that bypasses the model.
 | `--language` | `en` | Language code, or `auto` to detect |
 | `--input-device` | negotiated | Microphone index or name substring |
 | `--quiet` | off | Hide tool calls |
+| `--progress` | `speak` | Feedback while the model works: `speak`, `print` (screen only), `none` |
+| `--heartbeat` | `9.0` | Seconds of silence in a turn before a filler is spoken; `0` disables |
 | `--backend` | `claude` | `claude` = your Claude subscription (no key); `openai` = `AGENT_*` endpoint |
 | `--model` | backend default | Model id override |
 | `--server` | `../server.py` | Point at a different MCP server |
@@ -274,7 +307,8 @@ note it is the only one of the two with a stop key that bypasses the model.
 Behaviour constants worth knowing, all near the top of their file:
 `MAX_TOOL_STEPS`, `MAX_HISTORY_MESSAGES`, `STOP_TOOL` and the system prompt in
 `conversation.py`; `MIN_RMS`, `MIN_DURATION_S` and `RATE_CANDIDATES` in
-`stt.py`; `MAX_SPOKEN_CHARS` in `tts.py`.
+`stt.py`; `MAX_SPOKEN_CHARS` in `tts.py`; `HEARTBEAT_SECONDS`, `FILLERS` and
+`TOOL_PHRASES` in `progress.py`.
 
 The assistant answers in whatever language it is spoken to, so `--language`
 only sets what Whisper expects to hear and `--voice` only sets the accent it
@@ -284,7 +318,7 @@ replies in.
 
 ## 6. Why it is built this way
 
-Five decisions that are not obvious, and that you should not undo without
+Six decisions that are not obvious, and that you should not undo without
 knowing what they cost.
 
 **One long-lived MCP session, not one per utterance.** The server holds live
@@ -292,6 +326,13 @@ state: the active pattern inside `PatternRunner`, the trajectory job registry,
 the freedrive flag. Reconnecting between utterances would discard it, so "stir
 the pan" followed by "faster" would fail with *no pattern is running*. The
 session opens once and spans the whole conversation.
+
+**One thread speaks, and it owns the speaker.** `pygame.mixer` has a single
+music channel, so a progress line and an answer synthesised on two threads
+would cut each other off mid-word. Everything spoken goes through the
+`Narrator`'s worker thread, including the final reply — which is also why
+`narrator.finish()` blocks until playback really ends: the microphone must not
+open while the speakers are still talking, or the robot transcribes itself.
 
 **Push-to-talk on `ENTER`, not the `keyboard` library.** `keyboard` reads
 `/dev/input` and therefore needs root on Linux — an unacceptable setup step for
@@ -389,6 +430,7 @@ tool call the Diamond layer rejects. That goes to `voice/server.log`.
 | `tts.py` | ~140 | Edge neural voice, MP3 playback, speech text cleanup |
 | `bridge.py` | ~185 | MCP stdio client + OpenAI-compatible chat client |
 | `conversation.py` | ~170 | Persistent conversation, tool loop, system prompt, e-stop |
+| `progress.py` | ~330 | Spoken progress during a turn: commentary, tool phrases, heartbeat |
 | `run_voice.py` | ~210 | CLI entry point and the input loop |
 | `check_audio.py` | ~200 | Standalone self-test; no robot, no LLM |
 | `claude_backend.py` | ~160 | `--backend claude`: the Claude Code subscription as the brain |

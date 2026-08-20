@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 
 from bridge import LLMClient, ToolBridge
+from progress import NullNarrator
 
 # The tool that must always stop the arm. ``pause_motion`` is the right panic
 # button rather than ``finish_motion``: it preserves the anchor and phase so the
@@ -49,6 +50,9 @@ not "0.1987 m".
 - Say what you did or what you are about to do, not how you did it.
 
 How to act:
+- Before a tool call, write ONE short sentence saying what you are about to \
+do. It is spoken aloud while the robot works, so the person is not left in \
+silence: "Let me check where the arm is", "Moving over the pan now".
 - Check the robot's state before moving it if you do not know where it is.
 - If the request is ambiguous, ASK before moving. In particular, if the user \
 says "save this position" without specifying, ask whether they mean the \
@@ -86,14 +90,18 @@ class VoiceAgent:
         llm: The chat client.
         verbose: Print every tool call and result. On during development, off
             during the demo so the transcript stays readable.
+        narrator: Speaks progress while the turn runs. Defaults to silence,
+            which is what a caller with no speaker wants.
     """
 
     def __init__(self, tools: ToolBridge, schemas: list[dict],
-                 llm: LLMClient, verbose: bool = True) -> None:
+                 llm: LLMClient, verbose: bool = True,
+                 narrator=None) -> None:
         self.tools = tools
         self.schemas = schemas
         self.llm = llm
         self.verbose = verbose
+        self.narrator = narrator or NullNarrator()
         self.tool_names = [s["function"]["name"] for s in schemas]
         self.messages: list[dict] = [
             {"role": "system", "content": build_system_prompt(self.tool_names)}
@@ -118,9 +126,15 @@ class VoiceAgent:
 
     # --- the loop --------------------------------------------------------- #
     async def ask(self, utterance: str) -> str:
-        """Handle one spoken utterance and return the sentence to speak."""
+        """Handle one spoken utterance and return the sentence to speak.
+
+        Every tool call is announced to the narrator first, so a turn that
+        chains "check the state, move, confirm" is spoken through instead of
+        leaving the operator in silence until the last step returns.
+        """
         self.messages.append({"role": "user", "content": utterance})
         self._trim()
+        self.narrator.turn_started()
 
         for _step in range(MAX_TOOL_STEPS):
             # The OpenAI SDK is synchronous; keep the event loop free so the
@@ -132,9 +146,13 @@ class VoiceAgent:
             if not turn.tool_calls:
                 return (turn.text or "").strip() or FALLBACK_REPLY
 
+            # Text alongside tool calls is the model narrating what it is about
+            # to do; note_tool speaks it in preference to the canned phrase.
+            self.narrator.note_text(turn.text or "")
             for call in turn.tool_calls:
                 if self.verbose:
                     print(f"  -> {call.name}({call.arguments})")
+                self.narrator.note_tool(call.name, call.arguments)
                 result = await self.tools.call(call.name, call.arguments)
                 if self.verbose:
                     print(f"     {result[:300]}")

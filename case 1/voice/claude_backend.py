@@ -27,6 +27,7 @@ import sys
 
 from bridge import connect_tools
 from conversation import STOP_TOOL, build_system_prompt
+from progress import NullNarrator
 
 # The MCP server name the SDK is given. Tool names reaching the model are
 # "mcp__{SERVER_NAME}__{tool}", which is what allowed_tools must list.
@@ -48,14 +49,18 @@ class ClaudeCodeAgent:
         server_args: Its arguments (the path to ``server.py``).
         model: Model id, or None to use whatever the CLI is configured with.
         verbose: Print each tool call as it happens.
+        narrator: Speaks progress while the turn runs. Defaults to silence,
+            which is what a caller with no speaker wants.
     """
 
     def __init__(self, server_command: str, server_args: list[str],
-                 model: str | None = None, verbose: bool = True) -> None:
+                 model: str | None = None, verbose: bool = True,
+                 narrator=None) -> None:
         self._command = server_command
         self._args = list(server_args)
         self._model = model
         self.verbose = verbose
+        self.narrator = narrator or NullNarrator()
         self._client = None
         self._stop_tools = None
         self._stop_cm = None
@@ -110,13 +115,21 @@ class ClaudeCodeAgent:
 
     # --- the loop --------------------------------------------------------- #
     async def ask(self, utterance: str) -> str:
-        """Handle one spoken utterance and return the sentence to speak."""
+        """Handle one spoken utterance and return the sentence to speak.
+
+        The SDK streams the turn as it happens, so each block is handed to the
+        narrator on the way past: the model's commentary and its tool calls
+        become spoken progress instead of a wall of silence until the result
+        arrives. Nothing is buffered here that was not buffered before --
+        ``receive_response`` is already an async iterator.
+        """
         from claude_agent_sdk import (AssistantMessage, ResultMessage,
                                       TextBlock, ToolUseBlock)
 
         await self._client.query(utterance)
         texts: list[str] = []
         final: str | None = None
+        self.narrator.turn_started()
 
         async for message in self._client.receive_response():
             if isinstance(message, AssistantMessage):
@@ -124,8 +137,10 @@ class ClaudeCodeAgent:
                     if isinstance(block, ToolUseBlock):
                         if self.verbose:
                             print(f"  -> {block.name}({block.input})")
+                        self.narrator.note_tool(block.name, block.input)
                     elif isinstance(block, TextBlock) and block.text.strip():
                         texts.append(block.text.strip())
+                        self.narrator.note_text(block.text)
             elif isinstance(message, ResultMessage):
                 if isinstance(message.result, str) and message.result.strip():
                     final = message.result.strip()

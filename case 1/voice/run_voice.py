@@ -3,10 +3,16 @@
     python voice/run_voice.py                 # voice in, voice out
     python voice/run_voice.py --text          # typed in, voice out (no mic)
     python voice/run_voice.py --tts none      # typed/spoken in, printed out
+    python voice/run_voice.py --progress none # no commentary, answer only
     python voice/run_voice.py --list-devices  # which microphone is which
 
 At the prompt: ENTER starts and stops a recording, ``!`` stops the robot
 immediately, ``q`` quits. Ctrl-C also stops the robot before exiting.
+
+A turn that calls several tools takes many seconds, so the assistant speaks
+while it works -- its own "let me check where the arm is", a short line per
+tool call, and a filler if a single call blocks for longer than --heartbeat
+seconds. See ``progress.py``; ``--progress print`` keeps it on screen only.
 
 Nothing here is required by ``server.py``. Kill this program and the MCP server
 is still a normal MCP server for Claude Code, Cursor or the Case 3 agent.
@@ -21,6 +27,7 @@ import sys
 
 from bridge import LLMClient, connect_tools
 from conversation import STOP_ACKNOWLEDGED, VoiceAgent
+from progress import HEARTBEAT_SECONDS, make_narrator
 from tts import DEFAULT_VOICE, make_speaker
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +81,14 @@ def parse_args() -> argparse.Namespace:
                     help="print the audio devices and exit")
     ap.add_argument("--quiet", action="store_true",
                     help="hide tool calls (cleaner for the demo)")
+    ap.add_argument("--progress", choices=["speak", "print", "none"],
+                    default="speak",
+                    help="feedback while the model works: 'speak' says what it "
+                         "is doing out loud, 'print' shows it on screen only, "
+                         "'none' waits in silence for the answer")
+    ap.add_argument("--heartbeat", type=float, default=HEARTBEAT_SECONDS,
+                    help="seconds of silence during a turn before a filler is "
+                         "spoken; 0 disables it")
     ap.add_argument("--server-log", default=DEFAULT_SERVER_LOG,
                     help="file for the server's stderr ('-' to keep it on screen)")
     return ap.parse_args()
@@ -119,12 +134,16 @@ async def main() -> int:
         return 0
 
     speaker = make_speaker(kind=args.tts, voice=args.voice, rate=args.rate)
+    # From here on the narrator owns the speaker: it runs the one thread that
+    # is allowed to talk, so progress lines and answers cannot overlap.
+    narrator = make_narrator(speaker, mode=args.progress,
+                             heartbeat=args.heartbeat)
     try:
         mic = None if args.text else build_mic(args)
     except RuntimeError as exc:
         print(f"\n{exc}\n\nUntil the microphone works, use --text.",
               file=sys.stderr)
-        speaker.close()
+        close_voice(narrator, speaker)
         return 3
     transcriber = None if args.text else build_transcriber(args)
 
@@ -144,15 +163,16 @@ async def main() -> int:
                   "  pip install claude-agent-sdk\n"
                   "and a logged-in CLI (check: claude --version).\n"
                   "Or run with --backend openai.", file=sys.stderr)
-            speaker.close()
+            close_voice(narrator, speaker)
             return 2
         async with ClaudeCodeAgent(command, server_args, model=args.model,
-                                   verbose=not args.quiet) as agent:
+                                   verbose=not args.quiet,
+                                   narrator=narrator) as agent:
             print(f"connected: {len(agent.tool_names)} tools available "
                   f"(brain: Claude Code subscription)")
             print(BANNER)
-            await converse(args, agent, speaker, transcriber, mic)
-        speaker.close()
+            await converse(args, agent, narrator, transcriber, mic)
+        close_voice(narrator, speaker)
         print("closed. The MCP server remains usable on its own.")
         return 0
 
@@ -165,29 +185,38 @@ async def main() -> int:
               "  export AGENT_API_KEY=...\n  export AGENT_MODEL=...\n\n"
               "Free endpoints are listed in ../../llm-client/.\n"
               "Or use the default --backend claude.", file=sys.stderr)
-        speaker.close()
+        close_voice(narrator, speaker)
         return 2
 
     async with connect_tools(command, server_args, log_path=log_path) as tools:
         schemas = await tools.openai_tools()
-        agent = VoiceAgent(tools, schemas, llm, verbose=not args.quiet)
+        agent = VoiceAgent(tools, schemas, llm, verbose=not args.quiet,
+                           narrator=narrator)
         print(f"connected: {len(schemas)} tools available "
               f"(brain: {llm.model})")
         if log_path:
             print(f"server log: {log_path}")
         print(BANNER)
-        await converse(args, agent, speaker, transcriber, mic)
+        await converse(args, agent, narrator, transcriber, mic)
 
-    speaker.close()
+    close_voice(narrator, speaker)
     print("closed. The MCP server remains usable on its own.")
     return 0
 
 
-async def converse(args, agent, speaker, transcriber, mic) -> None:
+def close_voice(narrator, speaker) -> None:
+    """Stop the speaking thread before the mixer it uses goes away."""
+    narrator.close()
+    speaker.close()
+
+
+async def converse(args, agent, narrator, transcriber, mic) -> None:
     """The input loop, shared by both backends.
 
     Both agents expose the same two methods -- ``ask`` and ``emergency_stop``
-    -- so nothing below cares which brain is behind them.
+    -- so nothing below cares which brain is behind them. The narrator is the
+    only thing that speaks: the agents feed it progress during the turn, and
+    the answer goes through the same thread so the two never overlap.
     """
     while True:
         try:
@@ -196,6 +225,7 @@ async def converse(args, agent, speaker, transcriber, mic) -> None:
             )
         except KeyboardInterrupt:
             print("\ninterrupted -- stopping the robot")
+            narrator.cancel()
             await agent.emergency_stop()
             return
 
@@ -204,7 +234,9 @@ async def converse(args, agent, speaker, transcriber, mic) -> None:
         if utterance == "!":             # hard stop, no LLM in the path
             result = await agent.emergency_stop()
             print(f"     {result[:200]}")
-            await asyncio.to_thread(speaker.say, STOP_ACKNOWLEDGED)
+            # finish(), not a bare say(): it discards any progress line still
+            # queued, so the robot does not narrate a move it just abandoned.
+            await asyncio.to_thread(narrator.finish, STOP_ACKNOWLEDGED)
             continue
         if not utterance:                # silence or misfire
             print("  (did not catch that, try again)")
@@ -215,13 +247,16 @@ async def converse(args, agent, speaker, transcriber, mic) -> None:
             reply = await agent.ask(utterance)
         except KeyboardInterrupt:
             print("\ninterrupted -- stopping the robot")
+            narrator.cancel()
             await agent.emergency_stop()
             return
         except Exception as exc:
             reply = f"Error: {exc}"
         # Synthesis and playback block for seconds; keep them off the event
-        # loop so the MCP subprocess pipes stay serviced meanwhile.
-        await asyncio.to_thread(speaker.say, reply)
+        # loop so the MCP subprocess pipes stay serviced meanwhile. finish()
+        # returns once the line has actually been played, which is what stops
+        # the microphone from opening while the speakers are still talking.
+        await asyncio.to_thread(narrator.finish, reply)
 
 
 def read_utterance(args: argparse.Namespace, transcriber, mic) -> str | None:
