@@ -23,6 +23,7 @@ os.environ.setdefault("VISION_MODE", "sim")
 
 from fastmcp import Client  # noqa: E402
 
+from servo import VIEW_Q  # noqa: E402
 from vision_tools import engine, mcp  # noqa: E402
 
 
@@ -38,17 +39,18 @@ async def main() -> None:
         tools = {t.name for t in await client.list_tools()}
         need = {"look", "track_object", "descend_on", "stop_tracking",
                 "tracking_status", "calibrate_hand_eye", "place_sim_object",
-                "go_view_pose", "show_camera_view", "hide_camera_view"}
+                "show_camera_view", "hide_camera_view"}
         assert need <= tools, f"missing tools: {need - tools}"
         print("tools:", ", ".join(sorted(tools)))
 
         # Start from a healthy configuration: the arm may be parked in a
         # singular pose from earlier experiments, and the servo refuses
-        # movel steps from there (PolyScope X C204A1). The recovery path an
-        # LLM would take is exactly this tool.
-        out = unpack(await client.call_tool("go_view_pose", {}))
-        print("go_view_pose ->", out["state"])
-        assert out["ok"], out
+        # movel steps from there (PolyScope X C204A1). In the merged server
+        # the recovery is case 1's move_robot_to_position() with no
+        # arguments; this file drives vision_tools alone, so it commands the
+        # same pose straight through the engine's own robot client.
+        engine.robot.move_joint(VIEW_Q, 0.8, 1.0)
+        print("home/view pose ->", [round(v, 3) for v in engine.robot.get_tcp_pose()])
         tcp_view = engine.robot.get_tcp_pose()  # motion baseline for the end
 
         # An empty scene first: look() sees nothing, track_object refuses.

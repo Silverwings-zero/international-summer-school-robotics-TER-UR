@@ -42,11 +42,6 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from motion_patterns import PatternRunner, max_speed_for_radius
-from robotiq_gripper import (
-    HARDWARE_FAULTS,
-    GripperError,
-    RobotiqGripper,
-)
 from ur_client import (
     HOME_Q_RAD,
     JOINT_LIMIT,
@@ -124,54 +119,22 @@ SAFETY_STATUS_NAMES = {
     13: "SYSTEM_THREE_POSITION_ENABLING_STOP",
 }
 
-# The digital output a gripper listens on (tool IO convention; the simulator
-# has no physical gripper, so this drives the command line one would read).
-# On the real cell a Robotiq is driven through its URCap instead -- see
-# _robotiq() below; the pin stays as the simulator fallback.
-GRIPPER_PIN = 0
-
-# The Robotiq driver, connected lazily. None means "not found last time we
-# looked" -- and we look again on every gripper call, so plugging the gripper
-# in (or installing the URCap) later just works without a server restart.
-_GRIPPER_LOCK = threading.Lock()
-_ROBOTIQ: RobotiqGripper | None = None
-
-
-def _robotiq() -> RobotiqGripper | None:
-    """Return a live Robotiq driver, or None when no URCap answers."""
-    global _ROBOTIQ
-    with _GRIPPER_LOCK:
-        if _ROBOTIQ is not None:
-            return _ROBOTIQ
-    # Probe OUTSIDE the lock: when the controller is unreachable this blocks
-    # for the connect timeout, and holding the lock would serialize every
-    # gripper call (and get_robot_state) behind it.
-    candidate = RobotiqGripper(host=robot.host)
-    try:
-        candidate.connect()
-    except OSError:
-        return None
-    with _GRIPPER_LOCK:
-        if _ROBOTIQ is not None:
-            # Another thread won the race; keep its connection, drop ours.
-            winner = _ROBOTIQ
-            candidate.close()
-            return winner
-        _ROBOTIQ = candidate
-        return _ROBOTIQ
+# This cell's gripper hangs off the TOOL digital outputs, and those two pins
+# are the whole interface -- there is no smart-gripper protocol here, so no
+# width, force, or object-detection feedback exists. Drive it with the
+# ``set_tool_digital_out`` tool; these constants only name the convention so
+# state reads back in words.
+#   tool DO 0 -- the jaws:   False = CLOSE, True = OPEN
+#   tool DO 1 -- the speed:  True  = SLOW,  False = FAST
+GRIPPER_TOOL_PIN_JAWS = 0
+GRIPPER_TOOL_PIN_SPEED = 1
+# Tool IO occupies bits 16..17 of the RTDE digital-output word.
+TOOL_DO_BIT_OFFSET = 16
 
 
-def _drop_robotiq(failed: RobotiqGripper) -> None:
-    """Forget a dead connection so the next call re-probes from scratch.
-
-    Identity-aware: a late error from an old connection must not tear down
-    the healthy one that replaced it.
-    """
-    global _ROBOTIQ
-    with _GRIPPER_LOCK:
-        if _ROBOTIQ is failed:
-            _ROBOTIQ = None
-    failed.close()
+def _tool_do(digital_out: int, pin: int) -> bool:
+    """Read tool digital output ``pin`` (0..1) out of an RTDE IO word."""
+    return bool(digital_out >> (TOOL_DO_BIT_OFFSET + pin) & 1)
 
 
 # =========================================================================== #
@@ -776,7 +739,10 @@ def get_robot_state() -> dict:
 
     Returns:
         A dict with the full snapshot:
-        ``joints_deg``: per-joint angles in degrees, base..wrist3.
+        ``joints_deg`` / ``joints_rad``: per-joint angles, base..wrist3, in
+            degrees and in the controller's native radians. Radians are what
+            the waypoint bank and every URScript pose store, so copy those
+            when handing a taught pose back to the robot.
         ``tcp_pose_m_rad``: tool pose [x, y, z, rx, ry, rz] in the base frame,
             metres and radians (axis-angle rotation).
         ``robot_mode`` / ``robot_mode_name``: controller mode; 7 (RUNNING)
@@ -787,35 +753,24 @@ def get_robot_state() -> dict:
         ``ready_to_move``: True only when the mode is RUNNING and the safety
             status is NORMAL, so motion commands will be accepted.
         ``moving``: True while any joint is still in motion.
-        ``gripper_closed``: the COMMANDED gripper state (a Robotiq holding a
-            slim object sits mid-travel but still reads closed).
-        ``gripper_holding``: True when the Robotiq's fingers stopped on an
-            object, False when they reached the commanded position freely,
-            None when no Robotiq is connected (no contact sensing).
+        ``gripper_open`` / ``gripper_speed``: the two tool digital outputs the
+            gripper listens on, read back as words. There is no contact or
+            width feedback on this gripper -- these are the COMMANDED lines,
+            not a measurement of what the fingers are actually holding.
     """
     # 4. Execute (a read), then report in human units.
     state = robot.get_state()
-    # Both backends report the COMMANDED state, so the meaning of
-    # gripper_closed does not change with the hardware: on a Robotiq that is
-    # the requested position (PRE), not the actual one -- fingers holding a
-    # 30 mm cup sit mid-travel and must still read as "closed". Whether
-    # something is actually held is a separate flag. Only an
-    # already-connected Robotiq is consulted, so the state-read path never
-    # pays for a probe.
-    gripper_closed = bool(state.digital_out >> GRIPPER_PIN & 1)
-    gripper_holding: bool | None = None
-    robotiq = _ROBOTIQ
-    if robotiq is not None:
-        try:
-            gripper_closed = robotiq.get("PRE") > 128
-            gripper_holding = robotiq.get("OBJ") in (1, 2)
-        except (OSError, GripperError):
-            _drop_robotiq(robotiq)
-            gripper_holding = None
+    # The gripper is two tool digital outputs and nothing else, so all we can
+    # report is what was COMMANDED on those lines -- whether the fingers
+    # actually closed on something is not observable from here.
+    gripper_open = _tool_do(state.digital_out, GRIPPER_TOOL_PIN_JAWS)
+    gripper_slow = _tool_do(state.digital_out, GRIPPER_TOOL_PIN_SPEED)
     return {
-        "joints_deg": {n: round(math.degrees(q), 2)
+        "joints_deg": {n: round(math.degrees(q), 3)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_rad": {n: round(q, 6)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 6) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
         "robot_mode_name": ROBOT_MODE_NAMES.get(
             state.robot_mode, f"UNKNOWN({state.robot_mode})"),
@@ -825,8 +780,8 @@ def get_robot_state() -> dict:
         "ready_to_move": (state.robot_mode == ROBOT_MODE_RUNNING
                           and state.safety_status == 1),
         "moving": state.is_moving,
-        "gripper_closed": gripper_closed,
-        "gripper_holding": gripper_holding,
+        "gripper_open": gripper_open,
+        "gripper_speed": "slow" if gripper_slow else "fast",
     }
 
 
@@ -1129,240 +1084,47 @@ def get_trajectory_job_status(
 
 _FREEDRIVE_ACTIVE = False
 
-def _freedrive_worker():
+
+def _freedrive_script(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> str:
+    script = "  freedrive_mode"
+    if free_axes is not None or feature is not None:
+        args = []
+        if free_axes is not None:
+            if len(free_axes) != 6:
+                raise ValueError(
+                    f"free_axes must have 6 entries, got {len(free_axes)}.")
+            args.append(
+                "freeAxes=[" + ",".join(str(int(v)) for v in free_axes) + "]"
+            )
+        if feature is not None:
+            if len(feature) not in (5, 6):
+                raise ValueError(
+                    "feature must have 5 or 6 values, got "
+                    f"{len(feature)}.")
+            args.append(
+                "feature=p[" + ",".join(f"{float(v):.6f}" for v in feature) + "]"
+            )
+        script += "(" + ", ".join(args) + ")"
+    return script + "\n"
+
+
+
+def _freedrive_worker(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+):
     global _FREEDRIVE_ACTIVE
 
     try:
+        script = _freedrive_script(free_axes=free_axes, feature=feature)
         # This must stay alive long enough for freedrive to remain active.
         # If your API supports async execution, prefer that.
-        robot.run_script("  freedrive_mode()\n"
-                         f"  sleep({float(300):.3f})\n"
-                         , timeout_s=300.0)
+        robot.run_script(script + f"  sleep({float(300):.3f})\n", timeout_s=300.0)
     finally:
         _FREEDRIVE_ACTIVE = False
-
-# =========================================================================== #
-# DIAMOND TOOLS  --  gripper. On the real cell a Robotiq 2F is driven through
-# its URCap command server (port 63352 on the controller) with real position,
-# speed, force, and object-detection feedback. The simulator has no gripper,
-# so there the tools fall back to the digital-output convention and say so.
-# =========================================================================== #
-@mcp.tool
-def check_gripper() -> dict:
-    """Detect the gripper and report its state. Never moves anything.
-
-    Call this after (re)connecting hardware, and before the first grasp of a
-    session. It probes the Robotiq URCap port on the controller: when a
-    Robotiq answers, the report includes activation, position, and fault
-    state, plus the next step to take (``activate_gripper`` if it is not
-    yet activated). When nothing answers, gripper commands fall back to
-    driving digital output pin 0 -- the simulator convention, with no
-    force or object feedback.
-
-    Returns:
-        A dict with ``connected`` (a Robotiq answered), ``backend``
-        ("robotiq" or "digital-out-fallback"), and, for a live Robotiq,
-        its full status and a ``next_step`` hint.
-    """
-    gripper = _robotiq()
-    if gripper is None:
-        report = {
-            "connected": False,
-            "backend": "digital-out-fallback",
-            "detail": (
-                f"No Robotiq URCap answering on {robot.host}:63352. On the "
-                "simulator this is normal. On the real robot the URCap is "
-                "the only network path to the gripper: install/enable the "
-                "Robotiq Grippers URCap on the pendant (Settings > System > "
-                "URCaps), then call this again."),
-        }
-        # An unpowered tool connector is the other common reason a mounted
-        # gripper is silent, and it is worth reporting before the operator
-        # goes hunting through URCap menus.
-        try:
-            power = robot.get_tool_power()
-            report["tool_power"] = {
-                "voltage_v": power.voltage_v,
-                "current_a": round(power.current_a, 3),
-                "interface": power.tool_mode_name,
-                "powered": power.powered,
-            }
-            if not power.powered:
-                report["next_step"] = (
-                    "The tool connector is supplying 0 V, so a mounted "
-                    "gripper has no power at all. Set Tool Output Voltage to "
-                    "24 V (pendant: Installation > General > Tool I/O, or "
-                    "the set_tool_voltage tool) before debugging further.")
-        except Exception:  # noqa: BLE001 - diagnostics must never fail the tool
-            pass
-        return report
-    try:
-        status = gripper.status()
-    except (OSError, GripperError) as exc:
-        _drop_robotiq(gripper)
-        raise RuntimeError(
-            f"A gripper port answered but the status read failed: {exc}. "
-            "Retry check_gripper; if it keeps failing, power-cycle the "
-            "gripper.") from exc
-    report = {"connected": True, "backend": "robotiq", **status.as_dict()}
-    # A hardware fault outranks "not activated": an unplugged gripper is
-    # BOTH, and telling the operator to activate it just wastes their time.
-    if status.fault in HARDWARE_FAULTS:
-        report["next_step"] = (
-            f"Gripper reports {status.fault_name}: the URCap is running but "
-            "the gripper itself is not answering. Check the tool cable and "
-            "that the tool connector supplies 24 V, then call this again.")
-    elif status.fault:
-        report["next_step"] = (
-            f"Gripper reports fault {status.fault_name}; power-cycle the "
-            "gripper or re-run activate_gripper.")
-    elif not status.activated:
-        report["next_step"] = (
-            "Gripper is not activated. Clear the space in front of the "
-            "fingers (they sweep full travel to self-calibrate) and call "
-            "activate_gripper.")
-    return report
-
-
-@mcp.tool
-def activate_gripper() -> dict:
-    """Run the Robotiq activation cycle and wait until it is ready.
-
-    A Robotiq must be activated once after each power-up before it accepts
-    motion commands. Activation sweeps the fingers through their FULL travel
-    to self-calibrate -- make sure nothing (and nobody) is between them.
-    Already-activated grippers return immediately, so this is always safe
-    to call before a grasping task.
-
-    Returns:
-        The gripper status dict after activation (``activated`` true).
-
-    Raises:
-        ValueError: No Robotiq is connected (nothing to activate).
-        RuntimeError: Activation failed or timed out.
-    """
-    gripper = _robotiq()
-    if gripper is None:
-        raise ValueError(
-            f"No Robotiq URCap answering on {robot.host}:63352 -- nothing "
-            "to activate. Run check_gripper for diagnostics.")
-    try:
-        status = gripper.activate()
-    except GripperError as exc:
-        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
-    except OSError as exc:
-        _drop_robotiq(gripper)
-        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
-    return {"backend": "robotiq", **status.as_dict()}
-
-
-@mcp.tool
-def set_gripper_position(position_pct: float, speed_pct: float = 50.0,
-                         force_pct: float = 25.0) -> dict:
-    """Move the gripper fingers to a width, with speed and force control.
-
-    Use this instead of ``set_gripper`` when the opening matters: pre-opening
-    just wider than an object, or closing gently around something soft.
-    Blocks until the fingers arrive or stop on contact, so the returned
-    ``object_detected`` is trustworthy. Defaults are gentle on purpose --
-    this cell works alongside people.
-
-    Args:
-        position_pct: Target closure, 0 = fully open .. 100 = fully closed.
-        speed_pct: Finger speed, 0 (slowest) .. 100 (fastest).
-        force_pct: Grip force limit, 0 (lightest) .. 100 (strongest).
-
-    Returns:
-        The gripper status dict: ``position_pct`` and ``opening_mm``
-        actually reached, ``object_detected`` (fingers stopped early on
-        something), and the ``model`` the mm figure assumes.
-
-    Raises:
-        ValueError: Argument out of range, no Robotiq connected, or the
-            gripper is not activated yet.
-        RuntimeError: The gripper stopped answering mid-move.
-    """
-    # 1. Validate ranges before touching hardware.
-    for name, value in (("position_pct", position_pct),
-                        ("speed_pct", speed_pct), ("force_pct", force_pct)):
-        if not 0.0 <= value <= 100.0:
-            raise ValueError(f"{name} must be within 0..100, got {value}.")
-    gripper = _robotiq()
-    if gripper is None:
-        raise ValueError(
-            "Position control needs a Robotiq (none is connected). For the "
-            "simulator's on/off gripper use set_gripper instead.")
-    # 2. Convert percentages to the gripper's 0..255 registers.
-    try:
-        status = gripper.move(
-            position=round(position_pct / 100.0 * 255),
-            speed=round(speed_pct / 100.0 * 255),
-            force=round(force_pct / 100.0 * 255),
-        )
-    except GripperError as exc:
-        raise ValueError(str(exc)) from exc
-    except OSError as exc:
-        _drop_robotiq(gripper)
-        raise RuntimeError(
-            f"Lost the gripper connection mid-move: {exc}") from exc
-    return {"backend": "robotiq", **status.as_dict()}
-
-
-@mcp.tool
-def set_gripper(closed: bool) -> dict:
-    """Open or close the gripper.
-
-    Use ``closed=true`` to grip (before lifting an object) and
-    ``closed=false`` to release. With a Robotiq connected this closes at a
-    gentle default force and reports ``object_detected``: true means the
-    fingers stopped on something, so the grasp holds. False after a close
-    means they ran to the fully-closed stop -- usually a MISS, though a very
-    thin or soft item can also let them reach it, so confirm with
-    ``opening_mm`` (0 mm means nothing is between the fingers).
-    Without a Robotiq (the simulator) it falls back to driving the gripper
-    digital output and confirming it over RTDE. For finer control of width,
-    speed, or force use ``set_gripper_position``.
-
-    Args:
-        closed: True to close the gripper, False to open it.
-
-    Returns:
-        A dict with ``gripper`` ("closed" or "open") and ``backend``
-        ("robotiq": full status incl. ``object_detected``;
-        "digital-out-fallback": the ``pin`` and confirmed ``pin_state``).
-
-    Raises:
-        ValueError: The Robotiq is present but not activated yet.
-        RuntimeError: The robot is not powered on (fallback path), or the
-            gripper stopped answering.
-        TimeoutError: The controller did not confirm the output change.
-    """
-    gripper = _robotiq()
-    if gripper is not None:
-        try:
-            status = gripper.move(position=255 if closed else 0)
-        except GripperError as exc:
-            raise ValueError(str(exc)) from exc
-        except OSError as exc:
-            _drop_robotiq(gripper)
-            raise RuntimeError(
-                f"Lost the gripper connection mid-move: {exc}") from exc
-        return {
-            "gripper": "closed" if closed else "open",
-            "backend": "robotiq",
-            **status.as_dict(),
-        }
-    # Fallback: the simulator's digital-output convention, confirmed by
-    # reading the IO state back from the controller.
-    state = robot.set_digital_out(GRIPPER_PIN, closed)
-    confirmed = bool(state.digital_out >> GRIPPER_PIN & 1)
-    return {
-        "gripper": "closed" if confirmed else "open",
-        "backend": "digital-out-fallback",
-        "pin": GRIPPER_PIN,
-        "pin_state": confirmed,
-    }
-
 
 # =========================================================================== #
 # COMMISSIONING TOOLS  --  setup, IO checks, sensor prep, and manual guidance.
@@ -1528,105 +1290,145 @@ def is_within_safety_limits(
 
 
 @mcp.tool
-def get_digital_in(n: int) -> dict:
-    """Read digital input pin n (0..17).
-    The digital in and outputs relate to the robots IO pins. 
-    IT can read external devices like fixtures that are ready, etc. 
-    The digital in pins are read only and can be used to read the state of external devices. 
-    The digital out pins can be set to control external devices.
-    """
-    value = robot.get_digital_in(n)
-    return {"pin": n, "value": value}
-
-
-@mcp.tool
-def set_digital_out(n: int, b: bool) -> dict:
-    """Set digital output pin n (0..17) and confirm readback.
-        The digital in and outputs relate to the robots IO pins. 
-    IT can control external devices like lights, etc. 
-    """
-    state = robot.set_digital_out(n, b)
-    value = bool(state.digital_out >> n & 1)
-    return {"pin": n, "value": value}
-
-
-@mcp.tool
 def get_tool_digital_in(n: int) -> dict:
-    """Read tool digital input pin n (0..1)"""
+    """Read tool digital input pin n (0..1).
+
+    These are the two input lines on the wrist tool connector. The gripper
+    drives nothing back on them, so they say nothing about whether it is
+    holding something -- read ``get_robot_state`` for the commanded gripper
+    lines instead.
+    """
     value = robot.get_tool_digital_in(n)
     return {"pin": n, "value": value}
 
 
 @mcp.tool
 def set_tool_digital_out(n: int, b: bool) -> dict:
-    """Set tool digital output pin n (0..1) and confirm readback."""
+    """Set tool digital output pin n (0..1) and confirm readback.
+
+    THIS IS THE GRIPPER. The two tool outputs on the wrist connector are the
+    entire gripper interface in this cell -- there is no other gripper tool,
+    no width or force control, and no object-detection feedback:
+
+    - pin 0 -- the jaws:  ``b=false`` CLOSES the gripper, ``b=true`` OPENS it.
+    - pin 1 -- the speed: ``b=true`` moves SLOW, ``b=false`` moves FAST.
+
+    Set the speed pin before the jaw pin when it matters; the jaws act on the
+    speed that is selected at the moment they move. Use slow near a person's
+    hands or on anything fragile. Because nothing is fed back, a grasp cannot
+    be verified from the robot: look at the object (``look``) or ask the user
+    to confirm the item is held before lifting or moving away.
+
+    Args:
+        n: Tool output pin, 0 (jaws) or 1 (speed).
+        b: The line state -- see the pin meanings above.
+
+    Returns:
+        A dict with the ``pin``, its confirmed ``value``, and ``meaning``:
+        the gripper-level reading of that line ("open"/"closed",
+        "slow"/"fast").
+
+    Raises:
+        ValueError: Pin is not 0 or 1.
+        RuntimeError: The robot is not powered on and running.
+        TimeoutError: The controller did not confirm the output change.
+    """
     state = robot.set_tool_digital_out(n, b)
-    value = bool(state.digital_out >> (16 + n) & 1)
-    return {"pin": n, "value": value}
+    value = _tool_do(state.digital_out, n)
+    if n == GRIPPER_TOOL_PIN_JAWS:
+        meaning = "open" if value else "closed"
+    else:
+        meaning = "slow" if value else "fast"
+    return {"pin": n, "value": value, "meaning": meaning}
 
 
 @mcp.tool
-def set_tool_voltage(voltage: int) -> dict:
-    """Set tool connector voltage to 0 V, 12 V, or 24 V."""
-    robot.set_tool_voltage(voltage)
-    return {"status": "applied", "voltage_v": voltage}
+def timed_freedrive_mode(
+    duration_s: float = 10.0,
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> dict:
+    """Temporarily enable manual hand-guiding in freedrive mode.
 
+    Use this when the operator wants to move the robot by hand for a short
+    teaching or repositioning step. The robot remains compliant for the given
+    duration, then exits freedrive automatically.
 
-@mcp.tool
-def get_analog_in(n: int) -> dict:
-    """Read analog input channel n (0 or 1)."""
-    value = robot.get_analog_in(n)
-    return {"channel": n, "value": round(value, 6)}
+    Args:
+        duration_s: Length of the freedrive window in seconds. Typical values are
+            5-30 s; must be in [0.5, 120].
+        free_axes: Optional six-element list of 0/1 values that limits which
+            Cartesian/rotational axes are free. Example: [1, 0, 0, 0, 0, 0]
+            means only the X axis is free in the selected feature frame.
+        feature: Optional pose-like reference frame used together with
+            free_axes. Example: [0.1, 0.0, 0.0, 0.0, 0.785] creates a feature
+            frame offset from the current tool frame for the guided motion.
 
+    Returns:
+        A dict with ``status`` set to ``completed`` and the robot state at the
+        end of the timed freedrive period. The robot should be in normal mode
+        again after the timeout, because the script ends freedrive_mode() before
+        returning.
 
-@mcp.tool
-def set_analog_out(n: int, f: float) -> dict:
-    """Set analog output channel n (0 or 1) to normalized value f in [0,1]."""
-    robot.set_analog_out(n, f)
-    return {"status": "applied", "channel": n, "value": round(float(f), 6)}
-
-
-
-@mcp.tool
-def freedrive_mode(duration_s: float = 10.0) -> dict:
-    """Enable freedrive for manual guiding, keep it for a specific amount of time then automatically exit.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
-        
-     Args:   
-        duration_s: Freedrive hold time in seconds (0.5 to 120).
-        
+    Example URScript equivalent:
+        freedrive_mode(freeAxes=[1,0,0,0,0,0], feature=p[0.1,0,0,0,0.785])
     """
     if not 0.5 <= duration_s <= 120.0:
         raise ValueError(
             f"duration_s must be in [0.5, 120.0], got {duration_s}."
         )
-    body = (
-        "  freedrive_mode()\n"
-        f"  sleep({float(duration_s):.3f})\n"
-        "  end_freedrive_mode()\n"
-    )
+    body = _freedrive_script(free_axes=free_axes, feature=feature)
+    body += f"  sleep({float(duration_s):.3f})\n"
+    body += "  end_freedrive_mode()\n"
     state = robot.run_script(body, timeout_s=max(10.0, float(duration_s) + 5.0))
     return {
         "status": "completed",
         "duration_s": round(float(duration_s), 3),
-        "joints_deg": {n: round(math.degrees(q), 2)
+        "joints_deg": {n: round(math.degrees(q), 3)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_rad": {n: round(q, 6)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 6) for v in state.tcp_pose],
     }
 
 @mcp.tool
-def start_freedrive_mode() -> dict:
-    global _FREEDRIVE_ACTIVE
-    """Start freedrive for manual guiding. It will not stop until an ending command is sent.
-    Remind the user to call stop_freedrive_mode() when finished. 
-    Do not let the user call different commands remind them to stopp freedrive mode first.
-    With Freedrive you can quickly reajust the robot to a new position, go to a new point if you want to teach it.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+def start_freedrive_mode(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> dict:
+    """Start manual hand-guiding in freedrive mode until stop_freedrive_mode() is called.
+
+    Use this when the operator needs to reposition the robot by hand without
+    resisting motion, such as teaching a target pose, adjusting alignment, or
+    moving the tool clear of an obstacle. Freedrive is persistent until explicitly
+    ended; other motion commands should not be started while it is active.
+
+    Args:
+        free_axes: Optional six-element list of 0/1 values. A 1 means that axis is
+            free to move in the selected feature frame; a 0 locks it. Example:
+            [1, 0, 0, 0, 0, 0] allows motion only along the X axis.
+        feature: Optional pose-like frame definition used together with free_axes.
+            It defines the coordinate system in which the free axes are applied.
+            Example: [0.1, 0.0, 0.0, 0.0, 0.785] sets a local feature frame.
+
+    Returns:
+        A dict with ``status`` set to ``started`` when freedrive begins, or
+        ``already_started`` if it is already active. The expected robot behavior
+        is that the arm becomes compliant and can be moved by hand until
+        stop_freedrive_mode() is called.
+
+    Example URScript equivalent:
+        freedrive_mode(freeAxes=[1,0,0,0,0,0], feature=p[0.1,0,0,0,0.785])
     """
+    global _FREEDRIVE_ACTIVE
     if _FREEDRIVE_ACTIVE:
         return {"status": "already_started", "mode": "freedrive"}
     else:
-        thread = threading.Thread(target=_freedrive_worker, daemon=True)
+        thread = threading.Thread(
+            target=_freedrive_worker,
+            args=(free_axes, feature),
+            daemon=True,
+        )
         thread.start()
         _FREEDRIVE_ACTIVE = True
     return {"status": "started", "mode": "freedrive"}
@@ -1634,10 +1436,21 @@ def start_freedrive_mode() -> dict:
 
 @mcp.tool
 def stop_freedrive_mode() -> dict:
-    global _FREEDRIVE_ACTIVE
-    """Stop freedrive for manual guiding. It will stop the freedrive.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+    """End the freedrive started by start_freedrive_mode: the motors hold again.
+
+    Call this as soon as the operator says they are done guiding the arm by
+    hand. Freedrive is persistent, and no other motion tool should run while
+    it is active, so this is the gate every task must pass through before
+    moving on. Calling it when freedrive is not running is harmless.
+
+    Returns:
+        A dict with ``status`` -- ``stopped`` (freedrive ended, ``mode``
+        back to ``normal``) or ``not_active`` (it was not running).
+
+    Raises:
+        RuntimeError: The controller did not accept the end-freedrive script.
     """
+    global _FREEDRIVE_ACTIVE
     if not _FREEDRIVE_ACTIVE:
         return {"status": "not_active", "mode": "freedrive"}
     try:
@@ -1648,23 +1461,6 @@ def stop_freedrive_mode() -> dict:
         return {"status": "error", "mode": "freedrive", "message": "Failed to stop freedrive mode."}
 
 
-
-
-@mcp.tool
-def get_actual_tcp_pose() -> dict:
-    """Read current TCP pose [x, y, z, rx, ry, rz] in metres/radians."""
-    pose = robot.get_tcp_pose()
-    return {"tcp_pose_m_rad": [round(v, 6) for v in pose]}
-
-
-@mcp.tool
-def get_actual_joint_positions() -> dict:
-    """Read current joint positions in radians and degrees."""
-    q_rad = robot.get_joint_positions()
-    return {
-        "joints_rad": {n: round(v, 6) for n, v in zip(JOINT_NAMES, q_rad)},
-        "joints_deg": {n: round(math.degrees(v), 3) for n, v in zip(JOINT_NAMES, q_rad)},
-    }
 
 
 @mcp.tool
@@ -1878,54 +1674,6 @@ def move_to_stored_joint_configuration(
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
         "robot_mode": state.robot_mode,
     }
-
-
-@mcp.tool
-def movej(
-    joint_angles_deg: list[float],
-    speed: float = DEFAULT_SPEED,
-    acceleration: float = DEFAULT_ACCEL,
-) -> dict:
-    """URScript-style alias for move_robot_to_position (absolute joint move)."""
-    return move_robot_to_position(
-        joint_angles_deg=joint_angles_deg,
-        speed=speed,
-        acceleration=acceleration,
-    )
-
-
-@mcp.tool
-def move_joint(
-    joint_angles_deg: list[float] | None = None,
-    speed: float = DEFAULT_SPEED,
-    acceleration: float = DEFAULT_ACCEL,
-) -> dict:
-    """Compatibility alias for absolute joint motion.
-
-    Equivalent to ``move_robot_to_position``. Exposed so MCP clients and
-    rubrics that look for a ``move_joint`` tool name can call it directly.
-    """
-    return move_robot_to_position(
-        joint_angles_deg=joint_angles_deg,
-        speed=speed,
-        acceleration=acceleration,
-    )
-
-
-@mcp.tool
-def movel(
-    position_m: list[float],
-    rotation_rad: list[float] | None = None,
-    speed: float = 0.25,
-    acceleration: float = 1.2,
-) -> dict:
-    """URScript-style alias for move_linear (Cartesian straight-line move)."""
-    return move_linear(
-        position_m=position_m,
-        rotation_rad=rotation_rad,
-        speed=speed,
-        acceleration=acceleration,
-    )
 
 
 # =========================================================================== #

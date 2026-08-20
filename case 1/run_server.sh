@@ -56,7 +56,10 @@ export VISION_MODE=real          # no simulated camera
 export VISION_CAMERA=realsense   # fail loudly instead of falling back to webcam
 export VISION_MODEL="$CASE1/camera/yolo26n.pt"  # absolute: cwd/HOME differ under sudo
 
-# Cell-specific HOME/observation pose for go_view_pose, six joint angles in
+# Observation pose for the standalone camera viewer's 'v' key, six joint
+# angles in degrees. The merged server reaches this pose with case 1's
+# move_robot_to_position() instead, which reads HOME_Q_RAD -- keep the two in
+# step. Six joint angles in
 # degrees. The code default is the kitchen home [0,-90,90,-90,-90,0] (upper
 # arm vertical, forearm horizontal, tool straight down); once the base
 # bearing that faces YOUR table is taught, set it here (sudo strips env, so

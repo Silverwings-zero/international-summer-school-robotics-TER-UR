@@ -8,7 +8,7 @@ one go. Bronze through Diamond:
   * Silver  -- get_robot_state
   * Gold    -- move_joints_relative, move_linear, run_trajectory (blending)
   * Diamond -- safety layer rejections (speed caps, workspace, floor),
-               set_gripper via digital IO
+               the gripper via its two tool digital outputs
 
     python test_server.py
 
@@ -44,11 +44,11 @@ STRETCHED_DEG = [0, -90, 0, -90, 0, 0]
 REQUIRED_TOOLS = {
     "move_robot_to_position", "get_robot_state", "move_joints_relative",
     "move_linear", "run_trajectory", "start_trajectory_job",
-    "get_trajectory_job_status", "move_joint", "set_gripper", "set_payload",
-    "set_payload_mass", "set_gravity", "get_digital_in", "set_digital_out",
+    "get_trajectory_job_status", "set_payload",
+    "set_payload_mass", "set_gravity",
     "store_waypoint_pose_on_ur", "store_joint_configuration_on_ur",
     "move_to_stored_tcp_waypoint", "move_to_stored_joint_configuration",
-    "check_gripper", "activate_gripper", "set_gripper_position",
+    "get_tool_digital_in", "set_tool_digital_out",
     "example",
 }
 
@@ -88,7 +88,10 @@ async def main() -> None:
         assert len(state.data["tcp_pose_m_rad"]) == 6
         assert state.data["robot_mode_name"] == "RUNNING"
         assert state.data["ready_to_move"] is True
-        assert "moving" in state.data and "gripper_closed" in state.data
+        assert "moving" in state.data and "gripper_open" in state.data
+        # get_robot_state absorbed the deleted get_actual_* getters:
+        # it must carry radians as well as degrees.
+        assert "joints_rad" in state.data and "tcp_pose_m_rad" in state.data
         print("get_robot_state:", state.data["robot_mode_name"],
               state.data["safety_status_name"], state.data["joints_deg"])
 
@@ -103,16 +106,16 @@ async def main() -> None:
         assert pose.data["status"] == "reached"
         print("move pose:", pose.data["joints_deg"])
 
-        # Alias compatibility: move_joint should behave exactly like
-        # move_robot_to_position.
-        alias_pose = await client.call_tool(
-            "move_joint", {"joint_angles_deg": [15, -90, 0, -90, 0, 0]}
+        # move_robot_to_position is now the ONLY absolute joint move (the
+        # movej/move_joint aliases were removed); it also reports radians.
+        pose15 = await client.call_tool(
+            "move_robot_to_position", {"joint_angles_deg": [15, -90, 0, -90, 0, 0]}
         )
-        assert alias_pose.data["status"] == "reached"
-        print("move_joint alias:", alias_pose.data["joints_deg"])
+        assert pose15.data["status"] == "reached"
+        print("move to 15 deg:", pose15.data["joints_deg"])
 
         # --- Gold: relative move ------------------------------------------ #
-        base_before_rel = alias_pose.data["joints_deg"]["base"]
+        base_before_rel = pose15.data["joints_deg"]["base"]
         rel = await client.call_tool(
             "move_joints_relative", {"delta_deg": [10, 0, 0, 0, 0, 0]}
         )
@@ -295,28 +298,25 @@ async def main() -> None:
         stop_freedrive = await client.call_tool("stop_freedrive_mode", {})
         assert stop_freedrive.data["status"] == "stopped"
 
-        # --- Diamond: gripper. The simulator has no Robotiq URCap, so
-        # detection must report the fallback and set_gripper must drive the
-        # digital output, confirmed over RTDE. ----------------------------- #
-        detect = await client.call_tool("check_gripper", {})
-        assert detect.data["connected"] is False
-        assert detect.data["backend"] == "digital-out-fallback"
-        print("check_gripper:", detect.data["backend"])
-        grip = await client.call_tool("set_gripper", {"closed": True})
-        assert grip.data["gripper"] == "closed" and grip.data["pin_state"] is True
-        release = await client.call_tool("set_gripper", {"closed": False})
-        assert release.data["gripper"] == "open" and release.data["pin_state"] is False
-        print("gripper: close + open confirmed on DO pin", grip.data["pin"])
-        # Robotiq-only tools must refuse cleanly, not crash, without one.
+        # --- Diamond: the gripper is set_tool_digital_out and nothing else.
+        # Pin 0 is the jaws (False closes, True opens), pin 1 the speed
+        # (True slow, False fast); both are confirmed over RTDE. ---------- #
+        slow = await client.call_tool("set_tool_digital_out", {"n": 1, "b": True})
+        assert slow.data["value"] is True and slow.data["meaning"] == "slow"
+        grip = await client.call_tool("set_tool_digital_out", {"n": 0, "b": False})
+        assert grip.data["value"] is False and grip.data["meaning"] == "closed"
+        state = await client.call_tool("get_robot_state", {})
+        assert state.data["gripper_open"] is False
+        assert state.data["gripper_speed"] == "slow"
+        release = await client.call_tool("set_tool_digital_out", {"n": 0, "b": True})
+        assert release.data["value"] is True and release.data["meaning"] == "open"
+        fast = await client.call_tool("set_tool_digital_out", {"n": 1, "b": False})
+        assert fast.data["meaning"] == "fast"
+        print("gripper: close + open confirmed on tool DO 0, speed on tool DO 1")
+        # Only pins 0 and 1 exist on the tool connector.
         await expect_rejection(
-            client, "activate_gripper", {},
-            "activate-without-robotiq", must_contain="No Robotiq")
-        await expect_rejection(
-            client, "set_gripper_position", {"position_pct": 50.0},
-            "position-without-robotiq", must_contain="Robotiq")
-        await expect_rejection(
-            client, "set_gripper_position", {"position_pct": 150.0},
-            "position-out-of-range", must_contain="0..100")
+            client, "set_tool_digital_out", {"n": 2, "b": True},
+            "tool-do-out-of-range", must_contain="0 or 1")
 
         # --- The review-found race: an out-and-back path that ends where it
         # starts must actually RUN, not return 'reached' instantly. -------- #

@@ -87,11 +87,8 @@ TOOL_PHRASES = {
     "get_motion_status": "Checking the motion.",
     "is_within_safety_limits": "Checking that this is safe.",
     "move_linear": "Moving the arm.",
-    "movel": "Moving the arm.",
     "move_robot_to_position": "Moving the arm.",
     "move_joints_relative": "Turning the joints.",
-    "movej": "Turning the joints.",
-    "move_joint": "Turning the joints.",
     "move_to_stored_tcp_waypoint": "Going to the saved position.",
     "move_to_stored_joint_configuration": "Going to the saved position.",
     "store_waypoint_pose_on_ur": "Saving this position.",
@@ -106,7 +103,7 @@ TOOL_PHRASES = {
     "resume_motion": "Resuming.",
     "finish_motion": "Finishing the motion.",
     "start_freedrive_mode": "You can move the arm by hand now.",
-    "freedrive_mode": "You can move the arm by hand now.",
+    "timed_freedrive_mode": "You can move the arm by hand now.",
     "stop_freedrive_mode": "Freedrive is off.",
 }
 
@@ -118,12 +115,21 @@ def phrase_for_tool(name: str, arguments: dict | None = None) -> str:
         name: The tool name. Accepts the SDK's ``mcp__ur__move_linear`` form as
             well as the bare ``move_linear``.
         arguments: The call's arguments, used only where they change the verb
-            -- opening and closing a gripper are the same tool.
+            -- opening and closing the gripper are the same tool, told apart
+            by which tool output is being driven.
     """
     bare = name.rsplit("__", 1)[-1]
-    if bare == "set_gripper":
-        closed = bool((arguments or {}).get("closed"))
-        return "Closing the gripper." if closed else "Opening the gripper."
+    if bare == "set_tool_digital_out":
+        # The gripper IS the tool IO: pin 0 opens (True) or closes (False)
+        # the jaws, pin 1 picks slow (True) or fast (False).
+        args = arguments or {}
+        pin, value = args.get("n"), bool(args.get("b"))
+        if pin == 0:
+            return "Opening the gripper." if value else "Closing the gripper."
+        if pin == 1:
+            return ("Setting the gripper to slow." if value
+                    else "Setting the gripper to fast.")
+        return "Setting the tool output."
     if bare in TOOL_PHRASES:
         return TOOL_PHRASES[bare]
     if bare.startswith(("get_", "is_", "check_")):

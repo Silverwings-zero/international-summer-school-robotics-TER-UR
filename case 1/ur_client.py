@@ -56,8 +56,8 @@ _RTDE_OUTPUTS = (
     "standard_analog_input0,standard_analog_input1"
 )
 
-# Tool-connector supply, read separately (see get_tool_power): a smart tool
-# such as a Robotiq gripper is dead unless this reads 24 V.
+# Tool-connector supply, read separately (see get_tool_power): the gripper on
+# the wrist is dead unless this reads 24 V.
 _RTDE_TOOL_OUTPUTS = "tool_output_voltage,tool_output_current,tool_mode"
 
 # RTDE variable types, for recipes parsed from what the controller declares
@@ -194,7 +194,7 @@ class URClient:
     def get_tool_power(self) -> ToolPower:
         """Read the tool connector's supply -- "is my gripper powered?".
 
-        A Robotiq (or any smart tool) on the wrist runs off the tool
+        The gripper (like any tool on the wrist) runs off the tool
         connector's 24 V; when Tool Output Voltage is 0 V the tool is dead no
         matter how healthy the rest of the robot is. Unlike ``get_state``
         this parses the variable types the controller declares, because
