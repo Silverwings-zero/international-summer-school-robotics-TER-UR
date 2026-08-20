@@ -1,12 +1,7 @@
 {
+  "//": "Config for the local PolyScope X simulator (a UR10e). ONE server: run_vision_root.sh with no host argument stays on 127.0.0.1 and pins UR_MODEL=ur10e, launching case 1/server.py with UR_VISION=1 so case 4's camera tools mount into it. It still runs under sudo because the camera is a real D435 even when the robot is simulated. Copy this over .mcp.json and restart Claude Code.",
   "mcpServers": {
     "ur-tools": {
-      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
-      "args": [
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/server.py"
-      ]
-    },
-    "vision-tools": {
       "command": "/usr/bin/sudo",
       "args": [
         "-n",

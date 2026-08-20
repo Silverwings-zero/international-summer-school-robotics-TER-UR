@@ -86,9 +86,13 @@ watch the robot re-centre.
 ## Talking to it: the MCP tools
 
 `vision_tools.py` exposes the same engine as tools an LLM can call, so "track
-the cup" and "descend on the phone" become tool calls (registered in the repo
-`.mcp.json` as `vision-tools`, next to case 1's `ur-tools`; restart your MCP
-client after editing):
+the cup" and "descend on the phone" become tool calls. These no longer get an
+MCP entry of their own: `run_vision_root.sh` starts case 1's `server.py` with
+`UR_VISION=1`, which mounts this module's `mcp` into it, so the repo
+`.mcp.json` lists one `ur-tools` server carrying motion and vision together
+(names stay unprefixed -- `look`, not `vision_look`). Restart your MCP client
+after editing. To run this server on its own, launch `vision_tools.py`
+directly:
 
 | Tool | What it does |
 |------|--------------|

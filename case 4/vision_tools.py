@@ -31,6 +31,7 @@ Register next to ur-tools in ``.mcp.json``::
 """
 from __future__ import annotations
 
+import json
 import math
 import os
 import struct
@@ -70,6 +71,19 @@ SIM_HALF_FOV_X = SIM_CX / SIM_FX   # normalized-coordinate visibility bound
 SIM_HALF_FOV_Y = SIM_CY / SIM_FY
 
 MIN_STANDOFF_M = 0.10   # never regulate closer than this (D435 min range)
+
+# --- Grasp approach ------------------------------------------------------ #
+# The camera sits ABOVE the tool flange, so it is further from the object
+# than the fingertips are: the depth the camera reports is NOT the distance
+# left to travel. CAMERA_TO_FINGERTIP is that offset along the approach
+# axis, and no sensor can measure it -- it is taught per cell by
+# start_grasp_calibration/finish_grasp_calibration and cached here.
+GRASP_CAL_PATH = Path(__file__).with_name("grasp_calibration.json")
+# Depth below MIN_STANDOFF_M is unmeasurable, so the last stretch of a grasp
+# approach is necessarily open-loop. Cap how far we are willing to go blind.
+MAX_BLIND_DESCENT_M = 0.06
+GRASP_SPEED_MS = 0.03     # the final approach happens near the human's hands
+GRASP_ACCEL_MS2 = 0.2
 MAX_WAIT_S = 180.0
 
 # Camera-view window policy: "auto" pops it up when tracking starts and
@@ -423,6 +437,68 @@ def _matches(target: str, name: str) -> bool:
     return t == n or t in n or n in t
 
 
+@dataclass
+class GraspCalibration:
+    """Distance from the camera's depth origin to the fingertip plane.
+
+    Measured along the approach (tool +Z) axis, in metres. With it, the
+    fingertip gap for any camera reading ``d`` is simply ``d - camera_to_
+    fingertip_m``: zero means the fingers are at the taught grasp point.
+    """
+
+    camera_to_fingertip_m: float
+    source: str            # "taught" or "manual"
+    saved_at: str
+
+    def save(self, path: Path) -> None:
+        path.write_text(json.dumps({
+            "camera_to_fingertip_m": self.camera_to_fingertip_m,
+            "source": self.source, "saved_at": self.saved_at}, indent=2))
+
+    @classmethod
+    def load(cls, path: Path) -> "GraspCalibration | None":
+        if not path.exists():
+            return None
+        try:
+            d = json.loads(path.read_text())
+            return cls(camera_to_fingertip_m=float(d["camera_to_fingertip_m"]),
+                       source=str(d.get("source", "manual")),
+                       saved_at=str(d.get("saved_at", "unknown")))
+        except (ValueError, KeyError):
+            return None
+
+
+def _approach_axis(pose: list[float]) -> np.ndarray:
+    """Unit vector, in base coordinates, pointing from the tool at the table.
+
+    This is tool +Z: the direction the camera looks and the fingers close
+    around, and the axis a depth reading shrinks along.
+    """
+    return rotvec_to_matrix(pose[3:])[:, 2]
+
+
+# Reference pose + depth captured by start_grasp_calibration, consumed by
+# finish_grasp_calibration. One teach at a time; not persisted on purpose --
+# an interrupted teach should not survive a restart as a half-state.
+_grasp_teach: dict = {"pose": None, "depth_m": None, "object": None}
+
+
+def _require_grasp_calibration() -> GraspCalibration:
+    cal = GraspCalibration.load(GRASP_CAL_PATH)
+    if cal is None:
+        raise ValueError(
+            "This cell has no grasp calibration yet, so the distance from "
+            "the camera to the fingertips is unknown and any descent would "
+            "be a guess. Teach it once: put the object on the table, "
+            "start_grasp_calibration(object_name), then move the robot "
+            "(freedrive is easiest) until the fingers are exactly where "
+            "they should be to grip it, and call "
+            "finish_grasp_calibration(). Or set it directly with "
+            "set_grasp_calibration(camera_to_fingertip_m=...) if you have "
+            "measured it.")
+    return cal
+
+
 class Engine:
     """Perception thread + servo worker + target-by-name selection."""
 
@@ -699,6 +775,241 @@ def descend_on(object_name: str, standoff_m: float = 0.15,
         ValueError: bad standoff/wait, or no such object is visible.
     """
     return track_object(object_name, standoff_m=standoff_m, wait_s=wait_s)
+
+
+@mcp.tool
+def approach_to_grasp(object_name: str, grasp_depth_m: float = 0.0,
+                      wait_s: float = 90.0) -> dict:
+    """Bring the OPEN gripper around an object so it can be closed on it.
+
+    ``descend_on`` regulates the CAMERA to a standoff; this regulates the
+    FINGERTIPS to the object, using the taught camera-to-fingertip offset
+    (the camera sits above the flange, so it is always further away than
+    the fingers). Open the gripper BEFORE calling -- this positions the
+    fingers around the object and deliberately does not close them, so the
+    caller can check the view and then grip.
+
+    Tracking is stopped on return, leaving the robot frozen in the grasp
+    pose. If the object sits closer than the camera can measure, the last
+    stretch is a single open-loop step along the approach axis, capped at
+    ``MAX_BLIND_DESCENT_M``; ``blind_descent_m`` in the result says how much
+    of the approach was unservoed.
+
+    Args:
+        object_name: Loose match, as in track_object ("phone" finds
+            "cell phone"). Call look() first to learn the names.
+        grasp_depth_m: How far PAST the taught grasp point to go, in metres.
+            0 (default) stops exactly where the calibration was taught.
+            Positive descends deeper, negative stops higher; the useful
+            range is a couple of centimetres either way.
+        wait_s: Seconds to allow for the visual approach.
+
+    Raises:
+        ValueError: No calibration yet, no such object visible, or the
+            requested depth is out of range.
+        RuntimeError: The approach did not converge, so no blind descent
+            was attempted.
+    """
+    cal = _require_grasp_calibration()
+    if not -0.05 <= grasp_depth_m <= 0.05:
+        raise ValueError(
+            f"grasp_depth_m must be within +/-0.05 m of the taught grasp "
+            f"point (got {grasp_depth_m}).")
+    if not 0 < wait_s <= MAX_WAIT_S:
+        raise ValueError(f"wait_s must be in (0, {MAX_WAIT_S}] s.")
+
+    # Where the camera must end up for the fingertips to be at the object.
+    target_depth = cal.camera_to_fingertip_m - grasp_depth_m
+    if target_depth <= 0:
+        raise ValueError(
+            f"A grasp {grasp_depth_m} m past the taught point would put the "
+            f"camera through the object (target depth {target_depth:.3f} m). "
+            f"Reduce grasp_depth_m.")
+    if target_depth > 1.0:
+        raise ValueError(
+            f"Target camera depth {target_depth:.3f} m exceeds the 1.0 m "
+            f"tracking limit -- the calibration looks wrong; re-teach it.")
+
+    # Servo as close as depth can still be measured, then finish open-loop.
+    servo_depth = max(target_depth, MIN_STANDOFF_M)
+    blind = servo_depth - target_depth
+    if blind > MAX_BLIND_DESCENT_M:
+        raise ValueError(
+            f"The grasp point is {blind * 1000:.0f} mm below the closest "
+            f"distance the camera can measure ({MIN_STANDOFF_M} m), more "
+            f"than the {MAX_BLIND_DESCENT_M * 1000:.0f} mm this tool will "
+            f"travel blind. Mount the camera lower, or drive the last "
+            f"stretch by hand.")
+
+    st = track_object(object_name, standoff_m=servo_depth, wait_s=wait_s)
+    if not st.get("locked"):
+        engine.shared.servo_on.clear()
+        engine.viewer.close()
+        raise RuntimeError(
+            f"Visual approach did not lock on {object_name!r} within "
+            f"{wait_s:.0f} s (state: {st.get('state')}). The robot is "
+            f"stopped where it is and NO blind descent was attempted -- "
+            f"descending now would be aiming at an object the camera is "
+            f"not tracking.")
+    engine.shared.servo_on.clear()   # freeze: the pose is the grasp pose
+    engine.viewer.close()
+
+    result = dict(st)
+    result["blind_descent_m"] = round(blind, 4)
+    result["camera_to_fingertip_m"] = cal.camera_to_fingertip_m
+    result["target_camera_depth_m"] = round(target_depth, 4)
+    if blind > 1e-4:
+        pose = engine.robot.get_tcp_pose()
+        goal = np.array(pose[:3]) + _approach_axis(pose) * blind
+        engine.robot.move_linear(list(goal) + list(pose[3:]),
+                                 GRASP_SPEED_MS, GRASP_ACCEL_MS2)
+        result["state"] = (f"at grasp pose ({blind * 1000:.0f} mm of it "
+                           f"travelled blind)")
+    else:
+        result["state"] = "at grasp pose (fully servoed)"
+    result["tracking"] = False
+    result["next_step"] = ("close the gripper, then verify the grasp before "
+                           "lifting")
+    return result
+
+
+@mcp.tool
+def start_grasp_calibration(object_name: str) -> dict:
+    """Begin teaching where the fingertips are relative to the camera.
+
+    Step 1 of 2. Call this with the object visible at a comfortable
+    distance -- depth is read HERE, at a range the camera measures well,
+    not down at the grasp where it cannot. Then move the robot until the
+    fingers sit exactly where they would grip the object (freedrive is
+    easiest) and call finish_grasp_calibration().
+
+    The robot must not be tracking: this records a reference pose, and it
+    is only meaningful if the robot holds still afterwards until you move
+    it deliberately.
+
+    Raises:
+        ValueError: Tracking is still on, the object is not visible, or the
+            camera reports no depth for it.
+    """
+    if engine.shared.servo_on.is_set():
+        raise ValueError(
+            "Stop tracking first (stop_tracking) -- calibration needs the "
+            "robot to stay where you put it.")
+    percepts = [p for p in engine.visible() if _matches(object_name, p.name)]
+    if not percepts:
+        names = sorted({p.name for p in engine.visible()}) or ["nothing"]
+        raise ValueError(
+            f"No {object_name!r} in view; the camera sees: "
+            f"{', '.join(names)}.")
+    target = max(percepts, key=lambda p: p.conf)
+    if target.depth_m is None:
+        raise ValueError(
+            f"The camera reports no depth for {object_name!r}, so there is "
+            f"no reference to measure from. Move so the object is 0.3-0.5 m "
+            f"away and well inside the frame, then retry.")
+    pose = engine.robot.get_tcp_pose()
+    _grasp_teach["depth_m"] = float(target.depth_m)
+    _grasp_teach["pose"] = list(pose)
+    _grasp_teach["object"] = target.name
+    return {
+        "step": "1 of 2",
+        "object": target.name,
+        "reference_depth_m": round(float(target.depth_m), 4),
+        "next_step": ("move the robot until the fingers are exactly at the "
+                      "grip position on the object, then call "
+                      "finish_grasp_calibration()"),
+    }
+
+
+@mcp.tool
+def finish_grasp_calibration() -> dict:
+    """Finish teaching the camera-to-fingertip offset, and save it.
+
+    Step 2 of 2, called with the fingers sitting where they would grip the
+    object. The offset is the reference depth minus how far the tool has
+    travelled along the approach axis since start_grasp_calibration() --
+    so it never needs a depth reading at close range, where the camera has
+    none. Saved to grasp_calibration.json and used by approach_to_grasp.
+
+    Raises:
+        ValueError: No calibration was started, or the movement since then
+            does not look like an approach.
+    """
+    if _grasp_teach.get("pose") is None:
+        raise ValueError(
+            "Nothing to finish -- call start_grasp_calibration(object_name) "
+            "first, with the object visible at a comfortable distance.")
+    ref_pose = _grasp_teach["pose"]
+    ref_depth = _grasp_teach["depth_m"]
+    now = engine.robot.get_tcp_pose()
+    travel = float(np.dot(np.array(now[:3]) - np.array(ref_pose[:3]),
+                          _approach_axis(ref_pose)))
+    offset = ref_depth - travel
+    if travel <= 0:
+        raise ValueError(
+            f"The tool has not moved toward the object since the reference "
+            f"pose (travel {travel * 1000:+.0f} mm along the approach "
+            f"axis). Move it down to the grip position, then retry.")
+    if offset <= 0:
+        raise ValueError(
+            f"The tool travelled {travel * 1000:.0f} mm but the object was "
+            f"only {ref_depth * 1000:.0f} mm away, which would put the "
+            f"camera past it. Re-run start_grasp_calibration().")
+    cal = GraspCalibration(camera_to_fingertip_m=round(offset, 4),
+                           source="taught",
+                           saved_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    cal.save(GRASP_CAL_PATH)
+    _grasp_teach["pose"] = None
+    return {
+        "camera_to_fingertip_m": cal.camera_to_fingertip_m,
+        "travelled_m": round(travel, 4),
+        "reference_depth_m": round(ref_depth, 4),
+        "saved_to": str(GRASP_CAL_PATH),
+        "next_step": ("open the gripper and try "
+                      "approach_to_grasp(object_name); adjust with "
+                      "grasp_depth_m if it stops high or low"),
+    }
+
+
+@mcp.tool
+def get_grasp_calibration() -> dict:
+    """Report the taught camera-to-fingertip offset, or that none exists."""
+    cal = GraspCalibration.load(GRASP_CAL_PATH)
+    if cal is None:
+        return {"calibrated": False,
+                "next_step": ("teach it with start_grasp_calibration(...) "
+                              "then finish_grasp_calibration()")}
+    return {"calibrated": True,
+            "camera_to_fingertip_m": cal.camera_to_fingertip_m,
+            "source": cal.source, "saved_at": cal.saved_at,
+            "max_blind_descent_m": MAX_BLIND_DESCENT_M,
+            "min_measurable_depth_m": MIN_STANDOFF_M}
+
+
+@mcp.tool
+def set_grasp_calibration(camera_to_fingertip_m: float) -> dict:
+    """Set the camera-to-fingertip offset directly, in metres.
+
+    Use when the offset has been measured by hand (camera depth origin to
+    the fingertip plane, along the tool axis) instead of taught. The
+    two-step teach is preferred: it measures the same number the way the
+    servo will use it.
+
+    Raises:
+        ValueError: The value is outside a plausible range for a wrist
+            camera and gripper.
+    """
+    if not 0.02 <= camera_to_fingertip_m <= 0.60:
+        raise ValueError(
+            f"camera_to_fingertip_m must be 0.02-0.60 m (got "
+            f"{camera_to_fingertip_m}); outside that the mounting does not "
+            f"make sense and a grasp would drive into the table.")
+    cal = GraspCalibration(camera_to_fingertip_m=float(camera_to_fingertip_m),
+                           source="manual",
+                           saved_at=time.strftime("%Y-%m-%d %H:%M:%S"))
+    cal.save(GRASP_CAL_PATH)
+    return {"camera_to_fingertip_m": cal.camera_to_fingertip_m,
+            "source": cal.source, "saved_to": str(GRASP_CAL_PATH)}
 
 
 @mcp.tool

@@ -4,15 +4,32 @@ This repo runs a UR arm as a **collaborative kitchen robot**. The user gives a
 general command ("pour milk into the coffee"); Claude plans it with the MCP
 tools below, narrates the plan, and executes it **step by step together with
 the user** — the robot does what it can, and asks the human for everything it
-cannot do. Two MCP servers provide the tools:
+cannot do. **One MCP server, `ur-tools`, provides every tool** (59 of them):
 
-- **ur-tools** (`case 1/server.py`) — motion, gripper, waypoints, patterns, IO.
-- **vision-tools** (`case 4/vision_tools.py`) — wrist-camera perception and
-  visual servoing (look, track, descend).
+- motion, gripper, waypoints, patterns, IO — `case 1/server.py`.
+- wrist-camera perception and visual servoing (look, track, descend) —
+  `case 4/vision_tools.py`, mounted into the same process when `UR_VISION=1`,
+  with tool names unprefixed (`look`, not `vision_look`).
+
+`run_vision_root.sh` is the single entry point and launches both halves as one
+server under `sudo` — librealsense cannot claim the D435 on macOS without root,
+and the NOPASSWD rule in `/etc/sudoers.d/vision-tools` names that exact path,
+so **do not rename the wrapper** without editing sudoers too. sudo strips the
+environment, so every `UR_*`/`VISION_*` setting lives *in the wrapper*, not in
+`.mcp.json`; the robot host arrives as its first **argument**.
 
 `.mcp.json` selects the target: copy `mcp.simulator.json` (local PolyScope X
 sim, UR10e) or `mcp.real-robot.json` (real UR5e at 192.168.1.100) over it and
-restart the MCP client. Never drive the real UR5e with `UR_MODEL=ur10e`.
+restart the MCP client. The wrapper pins `UR_MODEL` to the host it was given
+(no argument → `ur10e` on 127.0.0.1; an IP → `ur5e` plus the real-robot speed
+caps), so the two can no longer split-brain. Never drive the real UR5e with
+`UR_MODEL=ur10e`.
+
+Without `UR_VISION`, `case 1/server.py` still starts alone as a robot-only
+server with 43 tools and needs no root — that is what the voice front-end
+(`case 1/voice/run_voice.py`) launches. A missing camera stack costs the
+perception tools, not the whole robot. Camera diagnostics still run the case 4
+server standalone: `sudo -n ./run_vision_root.sh --rs-probe` (or `--cam-test`).
 
 ## The command loop
 
@@ -178,7 +195,9 @@ teach the bearing that faces YOUR table, then set `VISION_VIEW_Q_DEG` in
    A URCap that connects but answers `STA ?` means it is running yet cannot
    reach the gripper — check tool voltage first, then the cable at the
    flange. The tools surface this as `GripperNotRespondingError`.
-4. `.mcp.json` = mcp.real-robot.json; restart the MCP client.
+4. `.mcp.json` = mcp.real-robot.json; restart the MCP client. One server
+   named `ur-tools` should appear, carrying the camera tools too; if `look`
+   is missing, read its stderr for `vision unavailable`.
 5. `get_robot_state` → RUNNING/NORMAL. `check_gripper` → `activate_gripper`
    if needed.
 4. First session after re-mounting the camera: place an object ~0.3 m below

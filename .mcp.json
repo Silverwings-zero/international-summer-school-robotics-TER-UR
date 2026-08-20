@@ -1,21 +1,7 @@
 {
-  "//": "Config for driving the REAL UR5e. To activate: IP is set (192.168.1.100). Run the preflight (case 1/preflight_real_robot.py <ip>), then copy this file over .mcp.json and restart Claude Code. Flip back to the simulator by restoring UR_HOST to 127.0.0.1 and UR_MODEL to ur10e (or git checkout .mcp.json).",
+  "//": "Config for driving the REAL UR5e. ONE server: run_vision_root.sh launches case 1/server.py with UR_VISION=1, which mounts case 4's camera tools into it, so motion and vision arrive as a single 'ur-tools' MCP. It runs under sudo because librealsense needs root for the D435 on macOS; the host (192.168.1.100) is the ARGUMENT because sudo strips env, and it pins UR_MODEL=ur5e inside the wrapper. To activate: run the preflight (case 1/preflight_real_robot.py <ip>), copy this over .mcp.json, restart Claude Code. Flip back with mcp.simulator.json (or git checkout .mcp.json).",
   "mcpServers": {
     "ur-tools": {
-      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
-      "args": [
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/server.py"
-      ],
-      "env": {
-        "UR_HOST": "192.168.1.100",
-        "UR_MODEL": "ur5e",
-        "UR_MAX_JOINT_SPEED": "1.0",
-        "UR_MAX_JOINT_ACCEL": "2.0",
-        "UR_MAX_TCP_SPEED": "0.4",
-        "UR_MAX_TCP_ACCEL": "1.2"
-      }
-    },
-    "vision-tools": {
       "command": "/usr/bin/sudo",
       "args": [
         "-n",

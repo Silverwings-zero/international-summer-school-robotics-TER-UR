@@ -2190,7 +2190,37 @@ def example() -> str:
     return "this was an example"
 
 
+# --- Case 4 vision tools (optional) -------------------------------------- #
+# UR_VISION=1 folds the wrist-camera server into this one, so the client sees a
+# single "ur-tools" MCP carrying both the motion and the perception tools.
+# The import is deferred to here on purpose: it pulls in OpenCV and YOLO, and
+# on macOS the RealSense it drives needs root (see run_vision_root.sh) -- the
+# robot-only path, which the voice front-end launches directly, should have to
+# satisfy neither. Mounting with no namespace keeps the vision tool names
+# unprefixed, so `look` stays `look` and CLAUDE.md keeps describing reality.
+VISION_ENABLED = os.environ.get("UR_VISION", "").strip().lower() in {
+    "1", "on", "true", "yes"}
+
+
+def _mount_vision() -> None:
+    """Fold case 4's vision tools into this server. Never fatal: a missing
+    camera stack costs the perception tools, not the whole robot."""
+    if not VISION_ENABLED:
+        return
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "case 4"))
+    try:
+        import vision_tools
+    except Exception as exc:      # no OpenCV/YOLO, unreadable VISION_MODEL, ...
+        print(f"[ur-tools] vision unavailable, motion tools only: {exc}",
+              file=sys.stderr)
+        return
+    mcp.mount(vision_tools.mcp)
+    print("[ur-tools] vision tools mounted (camera opens on first use)",
+          file=sys.stderr)
+
+
 if __name__ == "__main__":
+    _mount_vision()
     robot.connect()
     # A motion pattern runs as a loop ON THE CONTROLLER, so it outlives this
     # process. MCP clients stop their servers with SIGTERM, which would skip
