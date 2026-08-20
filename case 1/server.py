@@ -663,6 +663,7 @@ def move_robot_to_position(
     acceleration: float = DEFAULT_ACCEL,
 ) -> dict:
     """Move the robot to an absolute joint configuration and report the result.
+    Alias: move_joints_absolute, move_joints, move_j
 
     Give six target joint angles in degrees, ordered base, shoulder, elbow,
     wrist1, wrist2, wrist3. Omit them to send the robot to its HOME position
@@ -868,6 +869,7 @@ def move_linear(
     acceleration: float = 1.2,
 ) -> dict:
     """Move the TOOL TIP in a straight line to a Cartesian position.
+    Alias: move_l
 
     Use this when the path matters, not just the destination: approaching,
     inserting, drawing -- the tool tip travels a straight line in space
@@ -1472,20 +1474,27 @@ def stop_freedrive_mode() -> dict:
 
 
 @mcp.tool
-def store_waypoint_pose_on_ur(
+def store_waypoint_on_ur(
     variable_name: str,
+    pose_type: Literal["joints", "tcp"] = "joints",
+    joint_angles_deg: list[float] | None = None,
     tcp_pose_m_rad: list[float] | None = None,
 ) -> dict:
-    """Store a waypoint-compatible TCP pose variable on the UR controller.
+    """Store a waypoint-compatible variable on the UR controller.
 
-    Use this when the stored value should later be consumed by a PolyScope
-    Variable Waypoint. The variable will be written as a UR pose value:
-    p[x, y, z, rx, ry, rz].
+    Defaults to storing a joint configuration (six joint values). Pass
+    ``pose_type="tcp"`` to store a TCP pose instead, for use with a
+    PolyScope Variable Waypoint node.
 
     Args:
-        variable_name: Target UR variable name (e.g. "pick_tcp").
-        tcp_pose_m_rad: Optional explicit pose [x,y,z,rx,ry,rz] in m/rad.
-            If omitted, stores the current actual TCP pose.
+        variable_name: Target UR variable name (e.g. "pick_tcp", "home_q").
+        pose_type: "joints" (default) or "tcp".
+        joint_angles_deg: Optional explicit joint target in degrees, used
+            only when pose_type="joints". If omitted, stores the current
+            actual joints.
+        tcp_pose_m_rad: Optional explicit pose [x,y,z,rx,ry,rz] in m/rad,
+            used only when pose_type="tcp". If omitted, stores the current
+            actual TCP pose.
 
     Returns:
         A dict with storage details and waypoint compatibility flags.
@@ -1493,195 +1502,253 @@ def store_waypoint_pose_on_ur(
     Notes:
         To keep the value available across restarts and visible in PolyScope,
         create the same name as an Installation variable and use that variable
-        in a Variable Waypoint node. The server also caches the expression so
-        ``move_to_stored_tcp_waypoint`` can use it immediately in later calls,
-        even when the controller program context has restarted.
+        in the relevant program node. The server also caches the value so
+        the corresponding move_to_stored_* tool can use it immediately in
+        later calls, even when the controller program context has restarted.
     """
     name = _validate_ur_variable_name(variable_name)
-    if tcp_pose_m_rad is None:
-        values = [float(v) for v in robot.get_tcp_pose()]
-    else:
-        if len(tcp_pose_m_rad) != 6:
+
+    if pose_type == "joints":
+        if tcp_pose_m_rad is not None:
             raise ValueError(
-                f"Expected tcp_pose_m_rad with 6 values [x,y,z,rx,ry,rz], "
-                f"got {len(tcp_pose_m_rad)}."
+                "tcp_pose_m_rad was provided but pose_type='joints'; "
+                "pass pose_type='tcp' to store a TCP pose."
             )
-        values = [float(v) for v in tcp_pose_m_rad]
-        _check_reach(*values[:3], what="the pose being stored")
-        _check_flange_above_table(values[:3], values[3:])
-    robot.define_pose_variable(name, values)
-    _save_pose_to_waypoint_bank(name, values)
-    return {
-        "status": "stored_on_ur",
-        "tool": "store_waypoint_pose_on_ur",
-        "variable_name": name,
-        "pose_type": "tcp",
-        "value_m_rad": [round(v, 6) for v in values],
-        "storage": "ur_controller_variable + waypoints_lookup_table",
-        "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
-        "waypoint_compatible": True,
-        "recommended_program_use": "PolyScope Variable Waypoint",
-    }
+        if joint_angles_deg is None:
+            q_rad = [float(v) for v in robot.get_joint_positions()]
+        else:
+            q_rad = _checked_joint_target([float(v) for v in joint_angles_deg])
+        robot.define_joint_variable(name, q_rad)
+        _save_joint_to_waypoint_bank(name, q_rad)
+        return {
+            "status": "stored_on_ur",
+            "tool": "store_waypoint_on_ur",
+            "variable_name": name,
+            "pose_type": "joints",
+            "value_rad": [round(v, 6) for v in q_rad],
+            "value_deg": [round(math.degrees(v), 3) for v in q_rad],
+            "storage": "ur_controller_variable + waypoints_lookup_table",
+            "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
+            "waypoint_compatible": False,
+            "recommended_program_use": "Joint configuration/reference data",
+        }
 
+    elif pose_type == "tcp":
+        if joint_angles_deg is not None:
+            raise ValueError(
+                "joint_angles_deg was provided but pose_type='tcp'; "
+                "pass pose_type='joints' (or omit it) to store a joint configuration."
+            )
+        if tcp_pose_m_rad is None:
+            values = [float(v) for v in robot.get_tcp_pose()]
+        else:
+            if len(tcp_pose_m_rad) != 6:
+                raise ValueError(
+                    f"Expected tcp_pose_m_rad with 6 values [x,y,z,rx,ry,rz], "
+                    f"got {len(tcp_pose_m_rad)}."
+                )
+            values = [float(v) for v in tcp_pose_m_rad]
+            _check_reach(*values[:3], what="the pose being stored")
+            _check_flange_above_table(values[:3], values[3:])
+        robot.define_pose_variable(name, values)
+        _save_pose_to_waypoint_bank(name, values)
+        return {
+            "status": "stored_on_ur",
+            "tool": "store_waypoint_on_ur",
+            "variable_name": name,
+            "pose_type": "tcp",
+            "value_m_rad": [round(v, 6) for v in values],
+            "storage": "ur_controller_variable + waypoints_lookup_table",
+            "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
+            "waypoint_compatible": True,
+            "recommended_program_use": "PolyScope Variable Waypoint",
+        }
 
-@mcp.tool
-def store_joint_configuration_on_ur(
-    variable_name: str,
-    joint_angles_deg: list[float] | None = None,
-) -> dict:
-    """Store a joint configuration variable on the UR controller.
-
-    Use this when you want to save a robot configuration as six joint values,
-    then later move to it with ``move_to_stored_joint_configuration``.
-
-    Args:
-        variable_name: Target UR variable name (for example ``home_q``).
-        joint_angles_deg: Optional explicit joint target in degrees. If omitted,
-            stores the current actual joints.
-
-    Returns:
-        A dict with the stored joint configuration.
-
-    Notes:
-        The server caches the written value so
-        ``move_to_stored_joint_configuration`` can use it immediately in later
-        calls, even when the controller program context has restarted.
-    """
-    name = _validate_ur_variable_name(variable_name)
-    if joint_angles_deg is None:
-        q_rad = [float(v) for v in robot.get_joint_positions()]
     else:
-        q_rad = _checked_joint_target([float(v) for v in joint_angles_deg])
-    robot.define_joint_variable(name, q_rad)
-    _save_joint_to_waypoint_bank(name, q_rad)
-    return {
-        "status": "stored_on_ur",
-        "tool": "store_joint_configuration_on_ur",
-        "variable_name": name,
-        "pose_type": "joints",
-        "value_rad": [round(v, 6) for v in q_rad],
-        "value_deg": [round(math.degrees(v), 3) for v in q_rad],
-        "storage": "ur_controller_variable + waypoints_lookup_table",
-        "waypoints_lookup_table_path": str(_WAYPOINT_LOOKUP_TABLE_PATH),
-        "waypoint_compatible": False,
-        "recommended_program_use": "Joint configuration/reference data",
-    }
+        raise ValueError(f"Unknown pose_type '{pose_type}'; expected 'joints' or 'tcp'.")
 
+
+# @mcp.tool
+# def move_to_stored_tcp_waypoint(
+#     variable_name: str,
+#     speed: float = 0.25,
+#     acceleration: float = 1.2,
+#     timeout_s: float = 30.0,
+# ) -> dict:
+#     """Move linearly to a UR-side pose variable (no local memory lookup).
+
+#     This executes `movel(<variable_name>, ...)` on the controller, so the target
+#     is resolved from the UR variable directly. Use this with variables created by
+#     `store_waypoint_pose_on_ur` (pose values like p[x,y,z,rx,ry,rz]).
+
+#     Args:
+#         variable_name: Name of a UR pose variable present on the controller.
+#         speed: Cartesian speed in m/s.
+#         acceleration: Cartesian acceleration in m/s^2.
+#         timeout_s: Completion timeout in seconds.
+
+#     Returns:
+#         Final robot state snapshot after the move.
+#     """
+#     name = _validate_ur_variable_name(variable_name)
+#     _check_tcp_dynamics(speed, acceleration)
+#     if timeout_s <= 0:
+#         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+#     # The controller resolves the variable, but the move must still pass the
+#     # same geometric gate as move_linear -- a stored pose taught on a bigger
+#     # arm (or another cell) would otherwise replay unchecked. The pose is
+#     # looked up locally: first the waypoint bank, then the cached expression.
+#     pose = None
+#     bank = _load_waypoint_bank()
+#     entry = bank.get("pose_variables", {}).get(name)
+#     if isinstance(entry, list) and len(entry) == 6:
+#         pose = [float(v) for v in entry]
+#     elif isinstance(entry, dict) and isinstance(entry.get("value"), list):
+#         pose = [float(v) for v in entry["value"]]
+#     if pose is None:
+#         expr = robot._cached_ur_variable_expr(name)
+#         if expr and expr.startswith("p["):
+#             try:
+#                 pose = [float(v) for v in expr[2:-1].split(",")]
+#             except ValueError:
+#                 pose = None
+#     if pose is None or len(pose) != 6:
+#         raise ValueError(
+#             f"'{name}' is not in the local waypoint bank, so its target "
+#             "cannot be safety-checked before moving. Re-store it with "
+#             "store_waypoint_pose_on_ur first.")
+#     _check_reach(*pose[:3], what=f"stored waypoint '{name}'")
+#     _check_flange_above_table(pose[:3], pose[3:])
+
+#     state = robot.move_linear_to_variable(
+#         name,
+#         speed=float(speed),
+#         acceleration=float(acceleration),
+#         timeout_s=float(timeout_s),
+#     )
+#     return {
+#         "status": "executed",
+#         "source": "ur_controller_variable",
+#         "variable_name": name,
+#         "motion": "movel",
+#         "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+#         "joints_deg": {n: round(math.degrees(q), 1)
+#                        for n, q in zip(JOINT_NAMES, state.q_rad)},
+#         "robot_mode": state.robot_mode,
+#     }
+
+
+# @mcp.tool
+# def move_to_stored_joint_configuration(
+#     variable_name: str,
+#     speed: float = DEFAULT_SPEED,
+#     acceleration: float = DEFAULT_ACCEL,
+#     timeout_s: float = 30.0,
+# ) -> dict:
+#     """Move in joint space to a UR-side joint variable (no local memory lookup).
+
+#     This executes `movej(<variable_name>, ...)` on the controller, so the target
+#     is resolved from the UR variable directly. Use this with variables created by
+#     `store_joint_configuration_on_ur`.
+
+#     Args:
+#         variable_name: Name of a UR joint variable present on the controller.
+#         speed: Joint speed in rad/s.
+#         acceleration: Joint acceleration in rad/s^2.
+#         timeout_s: Completion timeout in seconds.
+
+#     Returns:
+#         Final robot state snapshot after the move.
+#     """
+#     name = _validate_ur_variable_name(variable_name)
+#     _check_joint_dynamics(speed, acceleration)
+#     if timeout_s <= 0:
+#         raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
+
+#     state = robot.move_joint_to_variable(
+#         name,
+#         speed=float(speed),
+#         acceleration=float(acceleration),
+#         timeout_s=float(timeout_s),
+#     )
+#     return {
+#         "status": "executed",
+#         "source": "ur_controller_variable",
+#         "variable_name": name,
+#         "motion": "movej",
+#         "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+#         "joints_deg": {n: round(math.degrees(q), 1)
+#                        for n, q in zip(JOINT_NAMES, state.q_rad)},
+#         "robot_mode": state.robot_mode,
+#     }
 
 @mcp.tool
-def move_to_stored_tcp_waypoint(
-    variable_name: str,
-    speed: float = 0.25,
-    acceleration: float = 1.2,
-    timeout_s: float = 30.0,
-) -> dict:
-    """Move linearly to a UR-side pose variable (no local memory lookup).
+def load_stored_waypoint(variable_name: str) -> dict:
+    """Load a previously stored waypoint from the local waypoint bank.
 
-    This executes `movel(<variable_name>, ...)` on the controller, so the target
-    is resolved from the UR variable directly. Use this with variables created by
-    `store_waypoint_pose_on_ur` (pose values like p[x,y,z,rx,ry,rz]).
+    Read-only: does not move the robot and does not touch the UR controller.
+    Returns the pose_type and values so the caller can pass them directly to
+    moveJ (joints) or moveL (tcp pose).
 
     Args:
-        variable_name: Name of a UR pose variable present on the controller.
-        speed: Cartesian speed in m/s.
-        acceleration: Cartesian acceleration in m/s^2.
-        timeout_s: Completion timeout in seconds.
+        variable_name: Name used when the waypoint was stored (e.g. via
+            store_waypoint_on_ur).
 
     Returns:
-        Final robot state snapshot after the move.
+        A dict with pose_type ("joints" or "tcp") and the corresponding
+        values, ready to hand to moveJ or moveL.
     """
     name = _validate_ur_variable_name(variable_name)
-    _check_tcp_dynamics(speed, acceleration)
-    if timeout_s <= 0:
-        raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
-
-    # The controller resolves the variable, but the move must still pass the
-    # same geometric gate as move_linear -- a stored pose taught on a bigger
-    # arm (or another cell) would otherwise replay unchecked. The pose is
-    # looked up locally: first the waypoint bank, then the cached expression.
-    pose = None
     bank = _load_waypoint_bank()
-    entry = bank.get("pose_variables", {}).get(name)
-    if isinstance(entry, list) and len(entry) == 6:
-        pose = [float(v) for v in entry]
-    elif isinstance(entry, dict) and isinstance(entry.get("value"), list):
-        pose = [float(v) for v in entry["value"]]
-    if pose is None:
-        expr = robot._cached_ur_variable_expr(name)
-        if expr and expr.startswith("p["):
-            try:
-                pose = [float(v) for v in expr[2:-1].split(",")]
-            except ValueError:
-                pose = None
-    if pose is None or len(pose) != 6:
-        raise ValueError(
-            f"'{name}' is not in the local waypoint bank, so its target "
-            "cannot be safety-checked before moving. Re-store it with "
-            "store_waypoint_pose_on_ur first.")
-    _check_reach(*pose[:3], what=f"stored waypoint '{name}'")
-    _check_flange_above_table(pose[:3], pose[3:])
 
-    state = robot.move_linear_to_variable(
-        name,
-        speed=float(speed),
-        acceleration=float(acceleration),
-        timeout_s=float(timeout_s),
+    joint_entry = bank.get("joint_variables", {}).get(name)
+    if joint_entry is not None:
+        q_rad = (
+            [float(v) for v in joint_entry]
+            if isinstance(joint_entry, list)
+            else [float(v) for v in joint_entry["value"]]
+        )
+        if len(q_rad) != 6:
+            raise ValueError(
+                f"Stored joint entry '{name}' has {len(q_rad)} values, expected 6."
+            )
+        return {
+            "status": "loaded",
+            "source": "waypoints_lookup_table",
+            "variable_name": name,
+            "pose_type": "joints",
+            "value_rad": [round(v, 6) for v in q_rad],
+            "value_deg": [round(math.degrees(v), 3) for v in q_rad],
+            "recommended_next_tool": "move_j",
+        }
+
+    pose_entry = bank.get("pose_variables", {}).get(name)
+    if pose_entry is not None:
+        pose = (
+            [float(v) for v in pose_entry]
+            if isinstance(pose_entry, list)
+            else [float(v) for v in pose_entry["value"]]
+        )
+        if len(pose) != 6:
+            raise ValueError(
+                f"Stored pose entry '{name}' has {len(pose)} values, expected 6."
+            )
+        _check_reach(*pose[:3], what=f"stored waypoint '{name}'")
+        _check_flange_above_table(pose[:3], pose[3:])
+        return {
+            "status": "loaded",
+            "source": "waypoints_lookup_table",
+            "variable_name": name,
+            "pose_type": "tcp",
+            "value_m_rad": [round(v, 6) for v in pose],
+            "recommended_next_tool": "move_l",
+        }
+
+    raise ValueError(
+        f"'{name}' was not found in the local waypoint bank. "
+        "Store it first with store_waypoint_on_ur."
     )
-    return {
-        "status": "executed",
-        "source": "ur_controller_variable",
-        "variable_name": name,
-        "motion": "movel",
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
-        "joints_deg": {n: round(math.degrees(q), 1)
-                       for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "robot_mode": state.robot_mode,
-    }
-
-
-@mcp.tool
-def move_to_stored_joint_configuration(
-    variable_name: str,
-    speed: float = DEFAULT_SPEED,
-    acceleration: float = DEFAULT_ACCEL,
-    timeout_s: float = 30.0,
-) -> dict:
-    """Move in joint space to a UR-side joint variable (no local memory lookup).
-
-    This executes `movej(<variable_name>, ...)` on the controller, so the target
-    is resolved from the UR variable directly. Use this with variables created by
-    `store_joint_configuration_on_ur`.
-
-    Args:
-        variable_name: Name of a UR joint variable present on the controller.
-        speed: Joint speed in rad/s.
-        acceleration: Joint acceleration in rad/s^2.
-        timeout_s: Completion timeout in seconds.
-
-    Returns:
-        Final robot state snapshot after the move.
-    """
-    name = _validate_ur_variable_name(variable_name)
-    _check_joint_dynamics(speed, acceleration)
-    if timeout_s <= 0:
-        raise ValueError(f"timeout_s must be > 0, got {timeout_s}.")
-
-    state = robot.move_joint_to_variable(
-        name,
-        speed=float(speed),
-        acceleration=float(acceleration),
-        timeout_s=float(timeout_s),
-    )
-    return {
-        "status": "executed",
-        "source": "ur_controller_variable",
-        "variable_name": name,
-        "motion": "movej",
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
-        "joints_deg": {n: round(math.degrees(q), 1)
-                       for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "robot_mode": state.robot_mode,
-    }
 
 
 # =========================================================================== #
