@@ -21,13 +21,6 @@ import re
 import socket
 import sys
 
-from robotiq_gripper import (
-    GRIPPER_PORT,
-    HARDWARE_FAULTS,
-    GripperError,
-    GripperNotRespondingError,
-    RobotiqGripper,
-)
 from ur_client import URClient
 
 DASHBOARD_PORT = 29999
@@ -194,67 +187,34 @@ def main() -> int:
     else:
         print("  skipped (ports unreachable)")
 
-    print("\n4. Robotiq gripper (optional -- informational only)")
+    print("\n4. Gripper (tool IO -- informational only)")
     if ports_ok:
-        # The URCap's command server lives on the controller; an answer means
-        # a Robotiq stack is installed. Absence is NOT a failure: the cell
-        # may run gripperless, or the gripper may be plugged in later
-        # (check_gripper re-probes on every call).
-        # Power first: a Robotiq runs off the tool connector's 24 V, so an
-        # unpowered tool explains a silent gripper before any protocol talk.
+        # The gripper is wired to the wrist tool connector: two digital
+        # outputs (pin 0 = jaws, closed on False; pin 1 = speed, slow on
+        # True) running off the connector's 24 V. Nothing is fed back, so
+        # all that can be checked here is power and the commanded lines.
         try:
-            power = URClient(host=host).get_tool_power()
+            client = URClient(host=host)
+            power = client.get_tool_power()
             verdict = "ok  " if power.powered else "note"
             print(f"  {verdict} tool connector: {power.voltage_v:.0f} V, "
                   f"{power.current_a * 1000:.0f} mA, interface "
                   f"{power.tool_mode_name}")
             if not power.powered:
-                print("       Tool Output Voltage is 0 V -- a Robotiq mounted "
-                      "here has NO power.")
+                print("       Tool Output Voltage is 0 V -- the gripper has "
+                      "NO power.")
                 print("       Pendant: Installation > General > Tool I/O > "
                       "Tool Output Voltage = 24 V")
                 print("       (or call the set_tool_voltage tool with 24 once "
                       "Remote Control is on).")
+            jaws = client.get_tool_digital_out(0)
+            speed = client.get_tool_digital_out(1)
+            print(f"  ok   tool DO 0 (jaws) = {jaws} "
+                  f"({'open' if jaws else 'closed'}), "
+                  f"tool DO 1 (speed) = {speed} "
+                  f"({'slow' if speed else 'fast'})")
         except Exception as exc:  # noqa: BLE001 - diagnostics must not abort
-            print(f"  note could not read tool power: {exc}")
-
-        gripper = RobotiqGripper(host=host, timeout_s=2.0)
-        try:
-            gripper.connect()
-        except OSError as exc:
-            print(f"  note no Robotiq URCap on port {GRIPPER_PORT} ({exc.__class__.__name__})")
-            print("       -- gripper tools fall back to digital output 0.")
-            print("       If a Robotiq IS mounted, install/enable the Robotiq")
-            print("       URCap on the pendant (Settings > System > URCaps);")
-            print("       nothing else bridges the tool RS-485 bus to TCP.")
-        else:
-            # connect() succeeded, so the URCap is alive: from here on a
-            # failure is the gripper or the daemon, NOT a missing URCap.
-            try:
-                status = gripper.status()
-                print(f"  ok   Robotiq URCap answering on port {GRIPPER_PORT}")
-                print(f"  ok   {status.model}: activated={status.activated}, "
-                      f"opening={status.opening_mm} mm, "
-                      f"fault={status.fault_name}")
-                if status.fault in HARDWARE_FAULTS:
-                    print(f"  note {status.fault_name}: the URCap is running "
-                          "but the gripper is not answering -- check the tool "
-                          "cable and 24 V tool power")
-                elif not status.activated:
-                    print("  note not activated yet -- run the "
-                          "activate_gripper tool (fingers sweep full travel)")
-            except GripperNotRespondingError:
-                print(f"  note the Robotiq URCap IS running on {GRIPPER_PORT}, "
-                      "but it cannot reach the gripper.")
-                print("       Fix the tool power above first -- that is the "
-                      "usual cause; then check the cable at the flange.")
-            except (OSError, GripperError) as exc:
-                print(f"  note URCap answered on {GRIPPER_PORT} but the status "
-                      f"read failed: {exc}")
-                print("       The daemon may be wedged -- restart the URCap "
-                      "or power-cycle the gripper.")
-            finally:
-                gripper.close()
+            print(f"  note could not read the tool IO: {exc}")
     else:
         print("  skipped (ports unreachable)")
 

@@ -318,7 +318,7 @@ note it is the only one of the two with a stop key that bypasses the model.
 | `--quiet` | off | Hide tool calls |
 | `--robot` | `$UR_HOST`, else sim | REAL arm at this IP; implies the `ur5e` safety envelope |
 | `--ur-model` | from `--robot` | Which arm the safety layer guards (`ur10e`/`ur5e`/`ur5`) |
-| `--vision` | on | Merged camera+robot server (59 tools); `--no-vision` gives 43 and no camera |
+| `--vision` | on | Merged camera+robot server (55 tools); `--no-vision` gives 39 and no camera |
 | `--progress` | `speak` | Feedback while the model works: `speak`, `print` (screen only), `none` |
 | `--heartbeat` | `9.0` | Seconds of silence in a turn before a filler is spoken; `0` disables |
 | `--backend` | `claude` | `claude` = your Claude subscription (no key); `openai` = `AGENT_*` endpoint |
