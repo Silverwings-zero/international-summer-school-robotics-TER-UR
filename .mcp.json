@@ -22,6 +22,18 @@
         "/Users/MichaelQ/international-summer-school-robotics-TER-UR/run_vision_root.sh",
         "192.168.1.100"
       ]
+    },
+    "voice-io": {
+      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
+      "args": [
+        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/voice/voice_mcp.py"
+      ],
+      "env": {
+        "VOICE_INPUT_DEVICE": "0",
+        "VOICE_TTS_VOICE": "en-US-AriaNeural",
+        "VOICE_LANGUAGE": "en",
+        "VOICE_STT_MODEL": "base"
+      }
     }
   }
 }
