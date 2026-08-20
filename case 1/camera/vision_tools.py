@@ -1057,37 +1057,6 @@ def tracking_status() -> dict:
 
 
 @mcp.tool
-def go_view_pose(wait_s: float = 45.0) -> dict:
-    """Joint-move the arm to the table-viewing pose (well-conditioned,
-    away from singularities). This is the same HOME pose case 1 uses:
-    upper arm vertical, forearm horizontal, tool pointing straight down, so
-    the wrist camera overlooks the table. Use it when track_object reports
-    the arm is refused/stopped near a singularity, or to get a fresh
-    overview of the table. Tracking must be off.
-
-    The BASE angle is cell-specific -- it decides which way the camera
-    faces, and the camera height differs between arms (a UR5e's shorter
-    links sit lower than the UR10e simulator's). Adapt it per cell by
-    exporting VISION_VIEW_Q_DEG (six comma-separated joint angles in
-    degrees) in run_server.sh; the code default is
-    "0,-90,90,-90,-90,0".
-
-    Raises:
-        ValueError: tracking is still on.
-    """
-    engine.ensure_started()
-    if engine.shared.servo_on.is_set():
-        raise ValueError("Tracking is on -- call stop_tracking() first.")
-    engine.shared.view_done.clear()
-    engine.shared.view_requested.set()
-    if engine.shared.view_done.wait(timeout=wait_s):
-        text, level = engine.shared.get_status()
-        return {"ok": level != "error", "state": text}
-    return {"ok": False, "state": f"view move still running after "
-                                  f"{wait_s:.0f} s -- check tracking_status"}
-
-
-@mcp.tool
 def calibrate_hand_eye(wait_s: float = 90.0) -> dict:
     """Measure how the camera is mounted (the hand-eye Jacobian) by probing
     each tool axis 15 mm and watching how the image responds. Needs an object

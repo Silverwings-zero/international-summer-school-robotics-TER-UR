@@ -58,7 +58,7 @@ Two shared pieces set up once, then pick a case.
 
 | Path | What |
 |------|------|
-| `case 1/` | MCP server: `server.py` (worked tool), `ur_client.py` (robot seam), `test_server.py` |
+| `case 1/` | MCP server: `server.py` (worked tool), `ur_client.py` (robot seam), `test_server.py`, plus `voice/` (speech front-end) and `camera/` (wrist-camera perception, formerly case 4) |
 | `case 2/` | Reality-gap RL: `train_distillation_model.py` (DistillModel), `dynamics.py` (Dynamics), `train_rla.py` (RL env), `metrics.py`, `run.py` |
 | `case 3/` | Autonomous agent: `agent.py` (the loop), `prompts.py`, `serializer.py`, `evaluator.py` |
 | `llm-client/` | The free LLM client setup (self-hosted and cloud-hosted guides) |

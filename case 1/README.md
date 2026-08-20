@@ -213,41 +213,35 @@ safety check would assume an arm twice the size.
 
 Flip back to the simulator by restoring `.mcp.json` (git checkout works).
 
-### Robotiq gripper (Hand-E)
+### Gripper (tool digital outputs)
 
-This cell's gripper is a **Robotiq Hand-E** (50 mm stroke, 20-185 N). It is
-driven through the Robotiq URCap's command server (port 63352 on the
-controller; `robotiq_gripper.py`, pure stdlib -- `ROBOTIQ_MODEL` selects
-`hand-e`/`2f-85`/`2f-140` for the mm and newton conversions). The tools:
+The gripper is wired straight to the **wrist tool connector**, and those two
+digital outputs are the whole interface. `set_tool_digital_out` is the only
+tool that touches it -- there is no gripper protocol, no width or force
+control, and no feedback of any kind:
 
-| tool | does |
-| --- | --- |
-| `check_gripper` | probe + full status; re-probes every call, so plugging the gripper in later just works |
-| `activate_gripper` | one-time self-calibration after power-up (fingers sweep full travel -- keep them clear) |
-| `set_gripper` | open/close; with a Robotiq it reports `object_detected` (false after a close = the grasp missed) |
-| `set_gripper_position` | width + speed + force control, gentle defaults, blocks until arrival/contact |
+| pin | line | `b=false` | `b=true` |
+| --- | --- | --- | --- |
+| 0 | jaws | **close** | **open** |
+| 1 | speed | fast | slow |
 
-Without a Robotiq (the simulator) `set_gripper` falls back to digital
-output 0 and says so (`backend: "digital-out-fallback"`).
+Set the speed pin before the jaw pin when it matters -- the jaws move at
+whatever speed is selected when they act. `get_robot_state` reports both
+lines back as `gripper_open` and `gripper_speed`, but those are the
+COMMANDED states: nothing is fed back, so a grasp cannot be verified from
+the robot. Look at the object (`look`) or ask the user to confirm before
+lifting.
 
-Two things must be true on the real cell, and `preflight_real_robot.py`
-checks both: **Tool Output Voltage = 24 V** (Installation > General > Tool
-I/O -- at 0 V the gripper is unpowered and nothing works) and the **Robotiq
-URCap running** (port 63352 accepts a connection). A URCap that connects but
-answers `STA ?` is running yet cannot reach the gripper -- that is a
-`GripperNotRespondingError`, and tool power is the usual cause.
-
-`test_robotiq_gripper.py` exercises the driver against a fake URCap
-(activation, contact detection, reply framing, concurrent commands, the
-`?` reply) and needs no robot and no gripper:
-
-    python3 test_robotiq_gripper.py
+One thing must be true on the real cell, and `preflight_real_robot.py`
+checks it: **Tool Output Voltage = 24 V** (Installation > General > Tool
+I/O). At 0 V the gripper is unpowered and the outputs do nothing.
 
 ### Home pose
 
 `HOME_Q_RAD` is the kitchen home `[0, -90, +90, -90, -90, 0]` deg: upper arm
 vertical, forearm horizontal, tool pointing straight down -- the wrist
 camera overlooks the table, and wrist2 at -90 keeps linear moves possible
-straight from home. `move_robot_to_position` with no arguments goes there;
-the camera's `go_view_pose` uses the same pose (override per cell via
-`VISION_VIEW_Q_DEG` in `run_server.sh`).
+straight from home. `move_robot_to_position` with no arguments goes there, and it is the only
+tool that does -- the camera half's `go_view_pose` was removed as a duplicate.
+`VISION_VIEW_Q_DEG` in `run_server.sh` now only steers the standalone camera
+viewer's `v` key, so keep it in step with `HOME_Q_RAD` if you change either.

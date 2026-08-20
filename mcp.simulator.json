@@ -1,17 +1,17 @@
 {
-  "//": "Config for the local PolyScope X simulator (a UR10e). ONE server: run_vision_root.sh with no host argument stays on 127.0.0.1 and pins UR_MODEL=ur10e, launching case 1/server.py with UR_VISION=1 so case 4's camera tools mount into it. It still runs under sudo because the camera is a real D435 even when the robot is simulated. Copy this over .mcp.json and restart Claude Code.",
+  "//": "Config for the local PolyScope X simulator (a UR10e). ONE server: case 1/run_server.sh with no host argument stays on 127.0.0.1 and pins UR_MODEL=ur10e, launching case 1/server.py with UR_VISION=1 so case 1/camera's vision tools mount into it (44 tools). It still runs under sudo because the camera is a real D435 even when the robot is simulated -- the NOPASSWD rule in /etc/sudoers.d/vision-tools must name this exact path, with the space in 'case 1' backslash-escaped. Copy this over .mcp.json and restart Claude Code.",
   "mcpServers": {
     "ur-tools": {
-      "command": "/usr/bin/sudo",
+      "command": "/bin/sh",
       "args": [
         "-n",
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/run_vision_root.sh"
+        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/run_server.sh"
       ]
     },
     "voice-io": {
-      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
+      "command": "python3",
       "args": [
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/voice/voice_mcp.py"
+        "case 1/voice/voice_mcp.py"
       ],
       "env": {
         "VOICE_INPUT_DEVICE": "0",
