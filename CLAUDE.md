@@ -4,19 +4,21 @@ This repo runs a UR arm as a **collaborative kitchen robot**. The user gives a
 general command ("pour milk into the coffee"); Claude plans it with the MCP
 tools below, narrates the plan, and executes it **step by step together with
 the user** — the robot does what it can, and asks the human for everything it
-cannot do. **One MCP server, `ur-tools`, provides every tool** (55 of them):
+cannot do. **One MCP server, `ur-tools`, provides every tool** (44 of them):
 
 - motion, gripper, waypoints, patterns, IO — `case 1/server.py`.
 - wrist-camera perception and visual servoing (look, track, descend) —
-  `case 4/vision_tools.py`, mounted into the same process when `UR_VISION=1`,
-  with tool names unprefixed (`look`, not `vision_look`).
+  `case 1/camera/vision_tools.py`, mounted into the same process when
+  `UR_VISION=1` (`mcp.mount(vision_tools.mcp)`, no namespace), so tool names
+  stay unprefixed (`look`, not `vision_look`).
 
-`run_vision_root.sh` is the single entry point and launches both halves as one
-server under `sudo` — librealsense cannot claim the D435 on macOS without root,
-and the NOPASSWD rule in `/etc/sudoers.d/vision-tools` names that exact path,
-so **do not rename the wrapper** without editing sudoers too. sudo strips the
-environment, so every `UR_*`/`VISION_*` setting lives *in the wrapper*, not in
-`.mcp.json`; the robot host arrives as its first **argument**.
+`case 1/run_server.sh` is the single entry point and launches both halves as
+one server under `sudo` — librealsense cannot claim the D435 on macOS without
+root, and the NOPASSWD rule in `/etc/sudoers.d/vision-tools` names that exact
+path, so **do not move the wrapper** without editing sudoers too (the space in
+`case 1` must be backslash-escaped there). sudo strips the environment, so
+every `UR_*`/`VISION_*` setting lives *in the wrapper*, not in `.mcp.json`;
+the robot host arrives as its first **argument**.
 
 `.mcp.json` selects the target: copy `mcp.simulator.json` (local PolyScope X
 sim, UR10e) or `mcp.real-robot.json` (real UR5e at 192.168.1.100) over it and
@@ -26,17 +28,19 @@ caps), so the two can no longer split-brain. Never drive the real UR5e with
 `UR_MODEL=ur10e`.
 
 Without `UR_VISION`, `case 1/server.py` still starts alone as a robot-only
-server with 39 tools and needs no root — that is what the voice front-end
-(`case 1/voice/run_voice.py`) launches. A missing camera stack costs the
-perception tools, not the whole robot. Camera diagnostics still run the case 4
-server standalone: `sudo -n ./run_vision_root.sh --rs-probe` (or `--cam-test`).
+server with 29 tools and needs no root — that is what the voice front-end
+(`case 1/voice/run_voice.py --no-vision`) launches. A missing camera stack
+costs the perception tools, not the whole robot: the mount is wrapped in a
+`try`, and an import failure only prints `camera unavailable` to stderr.
+Camera diagnostics run the vision server standalone:
+`sudo -n "case 1/run_server.sh" --rs-probe` (or `--cam-test`).
 
 ## The command loop
 
 For a general command:
 
-1. **Look first.** `go_view_pose` (= the home pose, camera straight down over
-   the table), then `what_can_you_see` / `look`. State what was found and
+1. **Look first.** `move_robot_to_position` with no arguments (= the home
+   pose, camera straight down over the table), then `what_can_you_see` / `look`. State what was found and
    what is missing; ask the user to add missing items to the table.
 2. **Plan aloud.** List the steps and which are robot steps vs. human steps.
    Get the user's OK before the first motion of a task.
@@ -45,8 +49,8 @@ For a general command:
 4. **When something is beyond the robot's ability, say so and hand it to the
    human** (see "Hand-over protocol"). Never improvise around a limitation
    with an unverified motion.
-5. **Finish** by returning to home (`go_view_pose`) and opening/parking the
-   gripper sensibly.
+5. **Finish** by returning to home (`move_robot_to_position`, no arguments)
+   and opening/parking the gripper sensibly.
 
 Speak in short sentences when the voice front-end (`case 1/voice/`) is in the
 loop: listen → act → speak one short status sentence → listen again.
@@ -99,7 +103,8 @@ whatever speed is selected at that moment. Use slow (`n=1, b=true`) near
 hands and for anything fragile; that is the default choice in this cell.
 
 The tool connector must supply **24 V** (pendant: Installation > General >
-Tool I/O, or `set_tool_voltage(24)`); at 0 V the gripper is unpowered and
+Tool I/O -- the pendant is the only way, there is no tool-voltage MCP tool);
+at 0 V the gripper is unpowered and
 the outputs do nothing. `preflight_real_robot.py` reports both the voltage
 and the current state of the two lines.
 
@@ -115,7 +120,8 @@ grasped by a narrower feature — rim, neck, handle — or handed over.
 
 For a regular, rigid object that fits between the open fingers:
 
-1. `go_view_pose`; `look` to confirm the object, its name, and `distance_m`.
+1. `move_robot_to_position` (no arguments); `look` to confirm the object,
+   its name, and `distance_m`.
 2. Select slow (`set_tool_digital_out(n=1, b=true)`) and open the gripper
    (`set_tool_digital_out(n=0, b=true)`) before descending.
 3. `descend_on(object_name, standoff_m=0.12)`, wait for LOCK, then
@@ -165,9 +171,12 @@ Home = view pose = `[0, -90, +90, -90, -90, 0]` deg (base..wrist3): first
 link vertical, forearm horizontal, tool pointing straight down, wrist2 at
 −90 (non-singular). It is `HOME_Q_RAD` in `case 1/ur_client.py` (used by
 `move_robot_to_position` with no args), `home_q` in the waypoint bank, and
-the default `VIEW_Q` in `case 4/servo.py`. The base angle is cell-specific:
-teach the bearing that faces YOUR table, then set `VISION_VIEW_Q_DEG` in
-`run_vision_root.sh` and re-store `home_q` so both servers agree.
+the default `VIEW_Q` in `case 1/camera/servo.py`. `move_robot_to_position`
+with no arguments is the ONLY tool that goes there — the camera half no
+longer carries its own `go_view_pose`. The base angle is cell-specific: teach
+the bearing that faces YOUR table, then edit `HOME_Q_RAD`, re-store `home_q`,
+and set `VISION_VIEW_Q_DEG` in `case 1/run_server.sh` so the standalone
+camera viewer's `v` key agrees with it.
 
 ## Safety, always
 
@@ -192,9 +201,10 @@ teach the bearing that faces YOUR table, then set `VISION_VIEW_Q_DEG` in
    dashboard (port 29999) must answer `true`.
 3. **Gripper needs tool power.** *Tool Output Voltage must be 24 V* — at
    0 V the gripper is unpowered and the tool outputs do nothing. Pendant:
-   Installation > General > Tool I/O > Tool Output Voltage = 24 V (or
-   `set_tool_voltage(24)` once Remote Control is on). `preflight_real_robot
-   .py` prints the voltage and the state of both gripper lines.
+   Installation > General > Tool I/O > Tool Output Voltage = 24 V. The
+   pendant is the only path -- no MCP tool sets tool voltage.
+   `preflight_real_robot.py` prints the voltage and the state of both
+   gripper lines.
 4. `.mcp.json` = mcp.real-robot.json; restart the MCP client. One server
    named `ur-tools` should appear, carrying the camera tools too; if `look`
    is missing, read its stderr for `vision unavailable`.
@@ -205,4 +215,5 @@ teach the bearing that faces YOUR table, then set `VISION_VIEW_Q_DEG` in
 6. First session after re-mounting the camera: place an object ~0.3 m below
    the camera and run `calibrate_hand_eye` (it refuses beyond ~0.5 m —
    image response too small).
-7. Verify home: `go_view_pose`, then `what_can_you_see` shows the table.
+7. Verify home: `move_robot_to_position` (no arguments), then
+   `what_can_you_see` shows the table.

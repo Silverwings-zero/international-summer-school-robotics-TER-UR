@@ -739,7 +739,10 @@ def get_robot_state() -> dict:
 
     Returns:
         A dict with the full snapshot:
-        ``joints_deg``: per-joint angles in degrees, base..wrist3.
+        ``joints_deg`` / ``joints_rad``: per-joint angles, base..wrist3, in
+            degrees and in the controller's native radians. Radians are what
+            the waypoint bank and every URScript pose store, so copy those
+            when handing a taught pose back to the robot.
         ``tcp_pose_m_rad``: tool pose [x, y, z, rx, ry, rz] in the base frame,
             metres and radians (axis-angle rotation).
         ``robot_mode`` / ``robot_mode_name``: controller mode; 7 (RUNNING)
@@ -763,9 +766,11 @@ def get_robot_state() -> dict:
     gripper_open = _tool_do(state.digital_out, GRIPPER_TOOL_PIN_JAWS)
     gripper_slow = _tool_do(state.digital_out, GRIPPER_TOOL_PIN_SPEED)
     return {
-        "joints_deg": {n: round(math.degrees(q), 2)
+        "joints_deg": {n: round(math.degrees(q), 3)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_rad": {n: round(q, 6)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 6) for v in state.tcp_pose],
         "robot_mode": state.robot_mode,
         "robot_mode_name": ROBOT_MODE_NAMES.get(
             state.robot_mode, f"UNKNOWN({state.robot_mode})"),
@@ -1285,29 +1290,6 @@ def is_within_safety_limits(
 
 
 @mcp.tool
-def get_digital_in(n: int) -> dict:
-    """Read digital input pin n (0..17).
-    The digital in and outputs relate to the robots IO pins. 
-    IT can read external devices like fixtures that are ready, etc. 
-    The digital in pins are read only and can be used to read the state of external devices. 
-    The digital out pins can be set to control external devices.
-    """
-    value = robot.get_digital_in(n)
-    return {"pin": n, "value": value}
-
-
-@mcp.tool
-def set_digital_out(n: int, b: bool) -> dict:
-    """Set digital output pin n (0..17) and confirm readback.
-        The digital in and outputs relate to the robots IO pins. 
-    IT can control external devices like lights, etc. 
-    """
-    state = robot.set_digital_out(n, b)
-    value = bool(state.digital_out >> n & 1)
-    return {"pin": n, "value": value}
-
-
-@mcp.tool
 def get_tool_digital_in(n: int) -> dict:
     """Read tool digital input pin n (0..1).
 
@@ -1361,28 +1343,6 @@ def set_tool_digital_out(n: int, b: bool) -> dict:
 
 
 @mcp.tool
-def set_tool_voltage(voltage: int) -> dict:
-    """Set tool connector voltage to 0 V, 12 V, or 24 V."""
-    robot.set_tool_voltage(voltage)
-    return {"status": "applied", "voltage_v": voltage}
-
-
-@mcp.tool
-def get_analog_in(n: int) -> dict:
-    """Read analog input channel n (0 or 1)."""
-    value = robot.get_analog_in(n)
-    return {"channel": n, "value": round(value, 6)}
-
-
-@mcp.tool
-def set_analog_out(n: int, f: float) -> dict:
-    """Set analog output channel n (0 or 1) to normalized value f in [0,1]."""
-    robot.set_analog_out(n, f)
-    return {"status": "applied", "channel": n, "value": round(float(f), 6)}
-
-
-
-@mcp.tool
 def timed_freedrive_mode(
     duration_s: float = 10.0,
     free_axes: list[int] | None = None,
@@ -1424,9 +1384,11 @@ def timed_freedrive_mode(
     return {
         "status": "completed",
         "duration_s": round(float(duration_s), 3),
-        "joints_deg": {n: round(math.degrees(q), 2)
+        "joints_deg": {n: round(math.degrees(q), 3)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
-        "tcp_pose_m_rad": [round(v, 4) for v in state.tcp_pose],
+        "joints_rad": {n: round(q, 6)
+                       for n, q in zip(JOINT_NAMES, state.q_rad)},
+        "tcp_pose_m_rad": [round(v, 6) for v in state.tcp_pose],
     }
 
 @mcp.tool
@@ -1434,7 +1396,6 @@ def start_freedrive_mode(
     free_axes: list[int] | None = None,
     feature: list[float] | None = None,
 ) -> dict:
-    global _FREEDRIVE_ACTIVE
     """Start manual hand-guiding in freedrive mode until stop_freedrive_mode() is called.
 
     Use this when the operator needs to reposition the robot by hand without
@@ -1459,6 +1420,7 @@ def start_freedrive_mode(
     Example URScript equivalent:
         freedrive_mode(freeAxes=[1,0,0,0,0,0], feature=p[0.1,0,0,0,0.785])
     """
+    global _FREEDRIVE_ACTIVE
     if _FREEDRIVE_ACTIVE:
         return {"status": "already_started", "mode": "freedrive"}
     else:
@@ -1474,10 +1436,21 @@ def start_freedrive_mode(
 
 @mcp.tool
 def stop_freedrive_mode() -> dict:
-    global _FREEDRIVE_ACTIVE
-    """Stop freedrive for manual guiding. It will stop the freedrive.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+    """End the freedrive started by start_freedrive_mode: the motors hold again.
+
+    Call this as soon as the operator says they are done guiding the arm by
+    hand. Freedrive is persistent, and no other motion tool should run while
+    it is active, so this is the gate every task must pass through before
+    moving on. Calling it when freedrive is not running is harmless.
+
+    Returns:
+        A dict with ``status`` -- ``stopped`` (freedrive ended, ``mode``
+        back to ``normal``) or ``not_active`` (it was not running).
+
+    Raises:
+        RuntimeError: The controller did not accept the end-freedrive script.
     """
+    global _FREEDRIVE_ACTIVE
     if not _FREEDRIVE_ACTIVE:
         return {"status": "not_active", "mode": "freedrive"}
     try:
@@ -1488,23 +1461,6 @@ def stop_freedrive_mode() -> dict:
         return {"status": "error", "mode": "freedrive", "message": "Failed to stop freedrive mode."}
 
 
-
-
-@mcp.tool
-def get_actual_tcp_pose() -> dict:
-    """Read current TCP pose [x, y, z, rx, ry, rz] in metres/radians."""
-    pose = robot.get_tcp_pose()
-    return {"tcp_pose_m_rad": [round(v, 6) for v in pose]}
-
-
-@mcp.tool
-def get_actual_joint_positions() -> dict:
-    """Read current joint positions in radians and degrees."""
-    q_rad = robot.get_joint_positions()
-    return {
-        "joints_rad": {n: round(v, 6) for n, v in zip(JOINT_NAMES, q_rad)},
-        "joints_deg": {n: round(math.degrees(v), 3) for n, v in zip(JOINT_NAMES, q_rad)},
-    }
 
 
 @mcp.tool
@@ -1718,54 +1674,6 @@ def move_to_stored_joint_configuration(
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
         "robot_mode": state.robot_mode,
     }
-
-
-@mcp.tool
-def movej(
-    joint_angles_deg: list[float],
-    speed: float = DEFAULT_SPEED,
-    acceleration: float = DEFAULT_ACCEL,
-) -> dict:
-    """URScript-style alias for move_robot_to_position (absolute joint move)."""
-    return move_robot_to_position(
-        joint_angles_deg=joint_angles_deg,
-        speed=speed,
-        acceleration=acceleration,
-    )
-
-
-@mcp.tool
-def move_joint(
-    joint_angles_deg: list[float] | None = None,
-    speed: float = DEFAULT_SPEED,
-    acceleration: float = DEFAULT_ACCEL,
-) -> dict:
-    """Compatibility alias for absolute joint motion.
-
-    Equivalent to ``move_robot_to_position``. Exposed so MCP clients and
-    rubrics that look for a ``move_joint`` tool name can call it directly.
-    """
-    return move_robot_to_position(
-        joint_angles_deg=joint_angles_deg,
-        speed=speed,
-        acceleration=acceleration,
-    )
-
-
-@mcp.tool
-def movel(
-    position_m: list[float],
-    rotation_rad: list[float] | None = None,
-    speed: float = 0.25,
-    acceleration: float = 1.2,
-) -> dict:
-    """URScript-style alias for move_linear (Cartesian straight-line move)."""
-    return move_linear(
-        position_m=position_m,
-        rotation_rad=rotation_rad,
-        speed=speed,
-        acceleration=acceleration,
-    )
 
 
 # =========================================================================== #

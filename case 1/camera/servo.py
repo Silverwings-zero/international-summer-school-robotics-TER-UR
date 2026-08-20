@@ -74,7 +74,9 @@ from detector import Detection, ObjectDetector  # noqa: E402
 # measure the true mapping -- calibration overrides this entirely.
 R_TOOL_CAM = np.eye(3)
 
-# Observation pose for the 'v' key and go_view_pose: joints (rad). Default is
+# Observation pose for the standalone viewer's 'v' key: joints (rad). The
+# merged MCP server reaches this pose with move_robot_to_position() instead.
+# Default is
 # the kitchen-cell HOME (same pose as case 1's HOME_Q_RAD): upper arm
 # vertical, forearm horizontal, tool pointing straight down, so the wrist
 # camera overlooks the table from ~0.5 m with wrist2 at -90 deg -- well clear
@@ -414,8 +416,10 @@ class ServoWorker(threading.Thread):
                     if why:
                         self.shared.servo_on.clear()
                         self.shared.set_status(
-                            f"refused: {why} -- go to the view pose first "
-                            "('v' key / go_view_pose tool)", "error")
+                            f"refused: {why} -- go to the home/view pose "
+                            "first (the 'v' key here, or case 1's "
+                            "move_robot_to_position tool with no arguments)",
+                            "error")
                         continue
                     self._p0 = np.array(st.tcp_pose[:3])
                     self._err_prev = None

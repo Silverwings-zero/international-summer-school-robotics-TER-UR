@@ -28,7 +28,7 @@ everything new is vision.
 
 This folder is a subpackage of case 1, the sibling of `../voice/`: the same
 server owns motion and perception, and `../run_server.sh` starts both as one
-59-tool MCP. It was case 4 until the stack was consolidated; every path here
+44-tool MCP. It was case 4 until the stack was consolidated; every path here
 is relative, so the tree moves without edits.
 
 ## Setup
@@ -106,7 +106,6 @@ directly:
 | `descend_on("phone", standoff_m=0.15)` | same law, tight standoff: close in on it |
 | `stop_tracking()` | freeze; nothing moves until the next command; closes the live view |
 | `tracking_status()` | LOCKED?, current error, depth -- poll during long moves |
-| `go_view_pose()` | joint-move to the safe viewing pose (the recovery from "refused: singular") |
 | `calibrate_hand_eye()` | the 30 s probing calibration, saved across restarts |
 | `show_camera_view()` / `hide_camera_view()` | open/close the live view without tracking |
 | `place_sim_object("cup", 0.5, 0.1, 0.05)` | sim mode only: put a virtual object in view |
@@ -125,7 +124,8 @@ Every command re-arms the safety box at the current pose, so each
 `track_object`/`descend_on` gets a fresh (but bounded) +-30 cm envelope.
 Servoing refuses to start -- and stops mid-flight -- near the wrist AND
 elbow singularities, where PolyScope X linear moves protective-stop with
-C204A1; `go_view_pose()` is the way out.
+C204A1; the way out is case 1's `move_robot_to_position()` with no
+arguments, which goes to the same home/view pose.
 
 `VISION_MODE=sim` (the default in `.mcp.json`) needs no camera at all: virtual
 objects are watched by a virtual wrist camera glued to the LIVE simulated TCP

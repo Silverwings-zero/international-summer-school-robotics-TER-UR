@@ -241,6 +241,7 @@ I/O). At 0 V the gripper is unpowered and the outputs do nothing.
 `HOME_Q_RAD` is the kitchen home `[0, -90, +90, -90, -90, 0]` deg: upper arm
 vertical, forearm horizontal, tool pointing straight down -- the wrist
 camera overlooks the table, and wrist2 at -90 keeps linear moves possible
-straight from home. `move_robot_to_position` with no arguments goes there;
-the camera's `go_view_pose` uses the same pose (override per cell via
-`VISION_VIEW_Q_DEG` in `run_server.sh`).
+straight from home. `move_robot_to_position` with no arguments goes there, and it is the only
+tool that does -- the camera half's `go_view_pose` was removed as a duplicate.
+`VISION_VIEW_Q_DEG` in `run_server.sh` now only steers the standalone camera
+viewer's `v` key, so keep it in step with `HOME_Q_RAD` if you change either.

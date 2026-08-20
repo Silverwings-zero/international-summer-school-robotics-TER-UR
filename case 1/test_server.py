@@ -44,8 +44,8 @@ STRETCHED_DEG = [0, -90, 0, -90, 0, 0]
 REQUIRED_TOOLS = {
     "move_robot_to_position", "get_robot_state", "move_joints_relative",
     "move_linear", "run_trajectory", "start_trajectory_job",
-    "get_trajectory_job_status", "move_joint", "set_payload",
-    "set_payload_mass", "set_gravity", "get_digital_in", "set_digital_out",
+    "get_trajectory_job_status", "set_payload",
+    "set_payload_mass", "set_gravity",
     "store_waypoint_pose_on_ur", "store_joint_configuration_on_ur",
     "move_to_stored_tcp_waypoint", "move_to_stored_joint_configuration",
     "get_tool_digital_in", "set_tool_digital_out",
@@ -89,6 +89,9 @@ async def main() -> None:
         assert state.data["robot_mode_name"] == "RUNNING"
         assert state.data["ready_to_move"] is True
         assert "moving" in state.data and "gripper_open" in state.data
+        # get_robot_state absorbed the deleted get_actual_* getters:
+        # it must carry radians as well as degrees.
+        assert "joints_rad" in state.data and "tcp_pose_m_rad" in state.data
         print("get_robot_state:", state.data["robot_mode_name"],
               state.data["safety_status_name"], state.data["joints_deg"])
 
@@ -103,16 +106,16 @@ async def main() -> None:
         assert pose.data["status"] == "reached"
         print("move pose:", pose.data["joints_deg"])
 
-        # Alias compatibility: move_joint should behave exactly like
-        # move_robot_to_position.
-        alias_pose = await client.call_tool(
-            "move_joint", {"joint_angles_deg": [15, -90, 0, -90, 0, 0]}
+        # move_robot_to_position is now the ONLY absolute joint move (the
+        # movej/move_joint aliases were removed); it also reports radians.
+        pose15 = await client.call_tool(
+            "move_robot_to_position", {"joint_angles_deg": [15, -90, 0, -90, 0, 0]}
         )
-        assert alias_pose.data["status"] == "reached"
-        print("move_joint alias:", alias_pose.data["joints_deg"])
+        assert pose15.data["status"] == "reached"
+        print("move to 15 deg:", pose15.data["joints_deg"])
 
         # --- Gold: relative move ------------------------------------------ #
-        base_before_rel = alias_pose.data["joints_deg"]["base"]
+        base_before_rel = pose15.data["joints_deg"]["base"]
         rel = await client.call_tool(
             "move_joints_relative", {"delta_deg": [10, 0, 0, 0, 0, 0]}
         )

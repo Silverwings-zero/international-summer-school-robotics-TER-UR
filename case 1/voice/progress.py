@@ -87,11 +87,8 @@ TOOL_PHRASES = {
     "get_motion_status": "Checking the motion.",
     "is_within_safety_limits": "Checking that this is safe.",
     "move_linear": "Moving the arm.",
-    "movel": "Moving the arm.",
     "move_robot_to_position": "Moving the arm.",
     "move_joints_relative": "Turning the joints.",
-    "movej": "Turning the joints.",
-    "move_joint": "Turning the joints.",
     "move_to_stored_tcp_waypoint": "Going to the saved position.",
     "move_to_stored_joint_configuration": "Going to the saved position.",
     "store_waypoint_pose_on_ur": "Saving this position.",
@@ -106,7 +103,7 @@ TOOL_PHRASES = {
     "resume_motion": "Resuming.",
     "finish_motion": "Finishing the motion.",
     "start_freedrive_mode": "You can move the arm by hand now.",
-    "freedrive_mode": "You can move the arm by hand now.",
+    "timed_freedrive_mode": "You can move the arm by hand now.",
     "stop_freedrive_mode": "Freedrive is off.",
 }
 

@@ -204,9 +204,8 @@ def main() -> int:
                 print("       Tool Output Voltage is 0 V -- the gripper has "
                       "NO power.")
                 print("       Pendant: Installation > General > Tool I/O > "
-                      "Tool Output Voltage = 24 V")
-                print("       (or call the set_tool_voltage tool with 24 once "
-                      "Remote Control is on).")
+                      "Tool Output Voltage = 24 V. That is the only way in: "
+                      "there is no tool-voltage MCP tool any more.")
             jaws = client.get_tool_digital_out(0)
             speed = client.get_tool_digital_out(1)
             print(f"  ok   tool DO 0 (jaws) = {jaws} "

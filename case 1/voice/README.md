@@ -1,7 +1,7 @@
 # Voice layer — talk to the UR10e out loud
 
 An optional speech front-end for the Case 1 MCP server. You hold a
-conversation; the model decides which of the server's 40 tools to call; the
+conversation; the model decides which of the server's 29 tools to call; the
 robot moves; the reply comes back as speech.
 
 Speech-to-text is [`faster-whisper`](https://github.com/SYSTRAN/faster-whisper)
@@ -40,7 +40,7 @@ server cannot tell the difference.
    ==================== process boundary (stdio) ======================
                 |                                              |
         +--------------------------------------------------------------+
-        | ../server.py      UNCHANGED. Diamond safety layer, 40 tools   |
+        | ../server.py      UNCHANGED. Diamond safety layer, 29 tools   |
         +--------------------------------------------------------------+
                                       |
                                  UR10e / simulator
@@ -318,7 +318,7 @@ note it is the only one of the two with a stop key that bypasses the model.
 | `--quiet` | off | Hide tool calls |
 | `--robot` | `$UR_HOST`, else sim | REAL arm at this IP; implies the `ur5e` safety envelope |
 | `--ur-model` | from `--robot` | Which arm the safety layer guards (`ur10e`/`ur5e`/`ur5`) |
-| `--vision` | on | Merged camera+robot server (55 tools); `--no-vision` gives 39 and no camera |
+| `--vision` | on | Merged camera+robot server (44 tools); `--no-vision` gives 29 and no camera |
 | `--progress` | `speak` | Feedback while the model works: `speak`, `print` (screen only), `none` |
 | `--heartbeat` | `9.0` | Seconds of silence in a turn before a filler is spoken; `0` disables |
 | `--backend` | `claude` | `claude` = your Claude subscription (no key); `openai` = `AGENT_*` endpoint |
