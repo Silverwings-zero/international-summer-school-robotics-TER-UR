@@ -1134,7 +1134,7 @@ def _freedrive_script(
     free_axes: list[int] | None = None,
     feature: list[float] | None = None,
 ) -> str:
-    script = "  freedrive_mode"
+    script = "  freedrive_mode()"
     if free_axes is not None or feature is not None:
         args = []
         if free_axes is not None:
@@ -1152,7 +1152,7 @@ def _freedrive_script(
             args.append(
                 "feature=p[" + ",".join(f"{float(v):.6f}" for v in feature) + "]"
             )
-        script += "(" + ", ".join(args) + ")"
+        script = "  freedrive_mode(" + ", ".join(args) + ")"
     return script + "\n"
 
 
@@ -1628,6 +1628,8 @@ def timed_freedrive_mode(
     Use this when the operator wants to move the robot by hand for a short
     teaching or repositioning step. The robot remains compliant for the given
     duration, then exits freedrive automatically.
+    Free_axes and feature should be none when not set 
+    
 
     Args:
         duration_s: Length of the freedrive window in seconds. Typical values are
@@ -1676,6 +1678,7 @@ def start_freedrive_mode(
     resisting motion, such as teaching a target pose, adjusting alignment, or
     moving the tool clear of an obstacle. Freedrive is persistent until explicitly
     ended; other motion commands should not be started while it is active.
+    Free_axes and feature should be none when not set 
 
     Args:
         free_axes: Optional six-element list of 0/1 values. A 1 means that axis is
