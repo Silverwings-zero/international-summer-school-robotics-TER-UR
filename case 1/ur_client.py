@@ -31,9 +31,13 @@ JOINT_NAMES = ("base", "shoulder", "elbow", "wrist1", "wrist2", "wrist3")
 # margin so a move never parks exactly on the mechanical limit.
 JOINT_LIMIT = 2 * math.pi - math.radians(2.0)
 
-# Canonical home pose, joint angles in radians (base..wrist3): upright column,
-# elbow square, tool pointing down. Same convention used across the three cases.
-HOME_Q_RAD = [0.0, -math.pi / 2, 0.0, -math.pi / 2, 0.0, 0.0]
+# Canonical home pose, joint angles in radians (base..wrist3). Kitchen-cell
+# convention: upper arm vertical, forearm horizontal, tool pointing straight
+# down -- the wrist camera overlooks the table from ~0.5 m, so "look at the
+# table" works from home. wrist2 at -90 deg keeps the pose clear of the wrist
+# singularity, so linear moves work directly from home (the old stretched
+# home [0, -90, 0, -90, 0, 0] was singular: elbow straight AND wrist aligned).
+HOME_Q_RAD = [0.0, -math.pi / 2, math.pi / 2, -math.pi / 2, -math.pi / 2, 0.0]
 
 # UR robot mode 7 == RUNNING (powered on, brakes released, ready to move).
 ROBOT_MODE_RUNNING = 7
@@ -51,6 +55,25 @@ _RTDE_OUTPUTS = (
     "actual_digital_output_bits,actual_digital_input_bits,"
     "standard_analog_input0,standard_analog_input1"
 )
+
+# Tool-connector supply, read separately (see get_tool_power): a smart tool
+# such as a Robotiq gripper is dead unless this reads 24 V.
+_RTDE_TOOL_OUTPUTS = "tool_output_voltage,tool_output_current,tool_mode"
+
+# RTDE variable types, for recipes parsed from what the controller declares
+# rather than from fixed offsets (PolyScope versions disagree on the width
+# of tool_output_voltage: 5.26 answers INT32, the spec says UINT8).
+_RTDE_TYPE_FORMATS = {
+    "BOOL": (">?", 1), "UINT8": (">B", 1), "INT32": (">i", 4),
+    "UINT32": (">I", 4), "INT64": (">q", 8), "UINT64": (">Q", 8),
+    "DOUBLE": (">d", 8),
+}
+
+# UR JointMode values the tool interface reports (tool_mode).
+TOOL_MODE_NAMES = {
+    245: "NOT_RESPONDING", 246: "MOTOR_INITIALISATION", 247: "BOOTING",
+    249: "BOOTLOADER", 252: "FAULT", 253: "RUNNING", 255: "IDLE",
+}
 
 
 @dataclass
@@ -70,6 +93,24 @@ class RobotState:
     def is_moving(self) -> bool:
         """True while any joint is still moving (above noise threshold)."""
         return max(abs(v) for v in self.qd_rad) > 0.01
+
+
+@dataclass
+class ToolPower:
+    """What the tool connector is supplying to a wrist-mounted tool."""
+
+    voltage_v: float   # Tool Output Voltage: 0, 12 or 24 V
+    current_a: float   # what the tool is drawing
+    tool_mode: int     # UR JointMode of the tool interface, 253 == RUNNING
+
+    @property
+    def tool_mode_name(self) -> str:
+        return TOOL_MODE_NAMES.get(self.tool_mode, f"UNKNOWN({self.tool_mode})")
+
+    @property
+    def powered(self) -> bool:
+        """True when the connector actually supplies a tool voltage."""
+        return self.voltage_v >= 1.0
 
 
 @dataclass
@@ -142,6 +183,44 @@ class URClient:
         return RobotState(q_rad=q, qd_rad=qd, tcp_pose=tcp, robot_mode=mode,
                   safety_status=safety, digital_out=dout,
                   digital_in=din, analog_in=[ain0, ain1])
+
+    def get_tool_power(self) -> ToolPower:
+        """Read the tool connector's supply -- "is my gripper powered?".
+
+        A Robotiq (or any smart tool) on the wrist runs off the tool
+        connector's 24 V; when Tool Output Voltage is 0 V the tool is dead no
+        matter how healthy the rest of the robot is. Unlike ``get_state``
+        this parses the variable types the controller declares, because
+        PolyScope versions disagree on how wide ``tool_output_voltage`` is.
+        """
+        with socket.create_connection((self.host, RTDE_PORT), timeout=5) as s:
+            self._rtde_send(s, _RTDE_REQUEST_PROTOCOL_VERSION,
+                            struct.pack(">H", 2))
+            self._rtde_recv(s)
+            self._rtde_send(
+                s, _RTDE_SETUP_OUTPUTS,
+                struct.pack(">d", 125.0) + _RTDE_TOOL_OUTPUTS.encode(),
+            )
+            _, reply = self._rtde_recv(s)  # recipe id byte + the type list
+            types = reply[1:].decode().split(",")
+            if any(t not in _RTDE_TYPE_FORMATS for t in types):
+                raise RuntimeError(
+                    f"Controller declared unsupported RTDE types: {types}")
+            self._rtde_send(s, _RTDE_START)
+            self._rtde_recv(s)
+            cmd, body = self._rtde_recv(s)
+            while cmd != _RTDE_DATA_PACKAGE:
+                cmd, body = self._rtde_recv(s)
+
+        off = 1  # first byte is the recipe id
+        values = []
+        for name in types:
+            fmt, size = _RTDE_TYPE_FORMATS[name]
+            values.append(struct.unpack(fmt, body[off:off + size])[0])
+            off += size
+        voltage, current, mode = values
+        return ToolPower(voltage_v=float(voltage), current_a=float(current),
+                         tool_mode=int(mode))
 
     def get_joint_positions(self) -> list[float]:
         """Actual joint angles in radians, base..wrist3."""

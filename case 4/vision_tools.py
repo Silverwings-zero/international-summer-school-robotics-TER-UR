@@ -745,14 +745,18 @@ def tracking_status() -> dict:
 @mcp.tool
 def go_view_pose(wait_s: float = 45.0) -> dict:
     """Joint-move the arm to the table-viewing pose (well-conditioned,
-    away from singularities). Use this when track_object reports the arm is
-    refused/stopped near a singularity, or to get a fresh overview of the
-    table. Tracking must be off.
+    away from singularities). This is the same HOME pose case 1 uses:
+    upper arm vertical, forearm horizontal, tool pointing straight down, so
+    the wrist camera overlooks the table. Use it when track_object reports
+    the arm is refused/stopped near a singularity, or to get a fresh
+    overview of the table. Tracking must be off.
 
-    The pose is CELL-SPECIFIC: it was taught on the simulator cell, and the
-    same joint angles put the camera somewhere else on a different arm
-    (26 cm lower on a UR5e). Re-teach VIEW_Q in servo.py for a new cell
-    before trusting it near a real table.
+    The BASE angle is cell-specific -- it decides which way the camera
+    faces, and the camera height differs between arms (a UR5e's shorter
+    links sit lower than the UR10e simulator's). Adapt it per cell by
+    exporting VISION_VIEW_Q_DEG (six comma-separated joint angles in
+    degrees) in run_vision_root.sh; the code default is
+    "0,-90,90,-90,-90,0".
 
     Raises:
         ValueError: tracking is still on.
