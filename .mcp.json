@@ -1,18 +1,17 @@
 {
-  "//": "Config for driving the REAL UR5e. ONE server: run_vision_root.sh launches case 1/server.py with UR_VISION=1, which mounts case 4's camera tools into it, so motion and vision arrive as a single 'ur-tools' MCP. It runs under sudo because librealsense needs root for the D435 on macOS; the host (192.168.1.100) is the ARGUMENT because sudo strips env, and it pins UR_MODEL=ur5e inside the wrapper. To activate: run the preflight (case 1/preflight_real_robot.py <ip>), copy this over .mcp.json, restart Claude Code. Flip back with mcp.simulator.json (or git checkout .mcp.json).",
+  "//": "REAL UR5e plus the real wrist camera. ONE server: 'case 1/run_server.sh' takes the host (192.168.1.100) as its ARGUMENT -- sudo strips env, so the target cannot be a variable -- and pins UR_MODEL=ur5e with reduced speed/accel caps inside the wrapper. UR_VISION=1 mounts case 1/camera's tools, giving 59 tools from one MCP. Paths are RELATIVE to the repo root, so this file works on any clone. macOS only: set command to '/usr/bin/sudo' and prepend '-n' to args. To activate: run the preflight (case 1/preflight_real_robot.py <ip>), copy this over .mcp.json, restart Claude Code. Flip back with mcp.simulator.json.",
   "mcpServers": {
     "ur-tools": {
-      "command": "/usr/bin/sudo",
+      "command": "/bin/sh",
       "args": [
-        "-n",
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/run_vision_root.sh",
+        "case 1/run_server.sh",
         "192.168.1.100"
       ]
     },
     "voice-io": {
-      "command": "/Users/MichaelQ/international-summer-school-robotics-TER-UR/.venv/bin/python",
+      "command": "python3",
       "args": [
-        "/Users/MichaelQ/international-summer-school-robotics-TER-UR/case 1/voice/voice_mcp.py"
+        "case 1/voice/voice_mcp.py"
       ],
       "env": {
         "VOICE_INPUT_DEVICE": "0",

@@ -8,12 +8,14 @@ cannot do. **One MCP server, `ur-tools`, provides every tool** (59 of them):
 
 - motion, gripper, waypoints, patterns, IO — `case 1/server.py`.
 - wrist-camera perception and visual servoing (look, track, descend) —
-  `case 4/vision_tools.py`, mounted into the same process when `UR_VISION=1`,
+  `case 1/camera/vision_tools.py`, mounted into the same process when
+  `UR_VISION=1`,
   with tool names unprefixed (`look`, not `vision_look`).
 
-`run_vision_root.sh` is the single entry point and launches both halves as one
-server under `sudo` — librealsense cannot claim the D435 on macOS without root,
-and the NOPASSWD rule in `/etc/sudoers.d/vision-tools` names that exact path,
+`case 1/run_server.sh` is the single entry point and launches both halves as
+one server. On macOS it must go under `sudo` — librealsense cannot claim the
+D435 there without root, and the NOPASSWD rule in
+`/etc/sudoers.d/vision-tools` names that exact path,
 so **do not rename the wrapper** without editing sudoers too. sudo strips the
 environment, so every `UR_*`/`VISION_*` setting lives *in the wrapper*, not in
 `.mcp.json`; the robot host arrives as its first **argument**.
@@ -28,8 +30,9 @@ caps), so the two can no longer split-brain. Never drive the real UR5e with
 Without `UR_VISION`, `case 1/server.py` still starts alone as a robot-only
 server with 43 tools and needs no root — that is what the voice front-end
 (`case 1/voice/run_voice.py`) launches. A missing camera stack costs the
-perception tools, not the whole robot. Camera diagnostics still run the case 4
-server standalone: `sudo -n ./run_vision_root.sh --rs-probe` (or `--cam-test`).
+perception tools, not the whole robot. Camera diagnostics still run the camera
+server standalone: `"case 1/run_server.sh" --rs-probe` (or `--cam-test`); on
+macOS prefix that with `sudo -n`.
 
 ## The command loop
 
@@ -156,9 +159,10 @@ Home = view pose = `[0, -90, +90, -90, -90, 0]` deg (base..wrist3): first
 link vertical, forearm horizontal, tool pointing straight down, wrist2 at
 −90 (non-singular). It is `HOME_Q_RAD` in `case 1/ur_client.py` (used by
 `move_robot_to_position` with no args), `home_q` in the waypoint bank, and
-the default `VIEW_Q` in `case 4/servo.py`. The base angle is cell-specific:
-teach the bearing that faces YOUR table, then set `VISION_VIEW_Q_DEG` in
-`run_vision_root.sh` and re-store `home_q` so both servers agree.
+the default `VIEW_Q` in `case 1/camera/servo.py`. The base angle is
+cell-specific: teach the bearing that faces YOUR table, then set
+`VISION_VIEW_Q_DEG` in `case 1/run_server.sh` and re-store `home_q` so both
+servers agree.
 
 ## Safety, always
 
