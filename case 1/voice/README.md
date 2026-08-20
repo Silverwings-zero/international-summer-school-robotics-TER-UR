@@ -130,12 +130,31 @@ problem in one paste.
 
 ## 4. Run
 
+### On the real robot
+
+Run the preflight first — it checks the ports, the dashboard and the RTDE read
+path, and never moves the arm:
+
+```bash
+cd "case 1"
+python3 preflight_real_robot.py 192.168.1.100
+python3 voice/run_voice.py --robot 192.168.1.100
+```
+
+Export `UR_HOST=192.168.1.100` to make that the default and drop the flag. A
+real address selects the **ur5e** safety envelope (±0.95 m workspace) and the
+reduced speed caps in `run_server.sh` — never let a real UR5e run under ur10e
+geometry, which would approve targets 40 cm past its reach.
+
+### On the simulator
+
 The simulator must be up (see [`../../simulation environment/`](../../simulation%20environment/))
 and the robot powered on with brakes released.
 
 ```bash
 cd "case 1"
-python voice/run_voice.py
+python voice/run_voice.py                 # loopback, ur10e
+python voice/run_voice.py --robot 127.0.0.1   # force it when UR_HOST is set
 ```
 
 Useful variants:
@@ -297,6 +316,9 @@ note it is the only one of the two with a stop key that bypasses the model.
 | `--language` | `en` | Language code, or `auto` to detect |
 | `--input-device` | negotiated | Microphone index or name substring |
 | `--quiet` | off | Hide tool calls |
+| `--robot` | `$UR_HOST`, else sim | REAL arm at this IP; implies the `ur5e` safety envelope |
+| `--ur-model` | from `--robot` | Which arm the safety layer guards (`ur10e`/`ur5e`/`ur5`) |
+| `--vision` | on | Merged camera+robot server (59 tools); `--no-vision` gives 43 and no camera |
 | `--progress` | `speak` | Feedback while the model works: `speak`, `print` (screen only), `none` |
 | `--heartbeat` | `9.0` | Seconds of silence in a turn before a filler is spoken; `0` disables |
 | `--backend` | `claude` | `claude` = your Claude subscription (no key); `openai` = `AGENT_*` endpoint |

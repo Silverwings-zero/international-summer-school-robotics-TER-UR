@@ -247,7 +247,7 @@ if not _HOST_IS_LOOPBACK and "UR_MODEL" not in os.environ:
         f"UR_MODEL is unset so the safety layer would guard a "
         f"'{UR_MODEL}'.\n"
         f"Name the arm explicitly -- UR_MODEL=ur5e for the summer-school "
-        f"UR5e -- or launch through run_vision_root.sh, which pins the host "
+        f"UR5e -- or launch through run_server.sh, which pins the host "
         f"and the model together so they cannot disagree.")
 _MODEL = _UR_MODELS[UR_MODEL]
 
@@ -2208,11 +2208,11 @@ def example() -> str:
     return "this was an example"
 
 
-# --- Case 4 vision tools (optional) -------------------------------------- #
+# --- Wrist-camera tools (optional) --------------------------------------- #
 # UR_VISION=1 folds the wrist-camera server into this one, so the client sees a
 # single "ur-tools" MCP carrying both the motion and the perception tools.
 # The import is deferred to here on purpose: it pulls in OpenCV and YOLO, and
-# on macOS the RealSense it drives needs root (see run_vision_root.sh) -- the
+# on macOS the RealSense it drives needs root (see camera/README.md) -- the
 # robot-only path, which the voice front-end launches directly, should have to
 # satisfy neither. Mounting with no namespace keeps the vision tool names
 # unprefixed, so `look` stays `look` and CLAUDE.md keeps describing reality.
@@ -2221,15 +2221,18 @@ VISION_ENABLED = os.environ.get("UR_VISION", "").strip().lower() in {
 
 
 def _mount_vision() -> None:
-    """Fold case 4's vision tools into this server. Never fatal: a missing
+    """Fold camera/'s vision tools into this server. Never fatal: a missing
     camera stack costs the perception tools, not the whole robot."""
     if not VISION_ENABLED:
         return
-    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "case 4"))
+    # camera/ is a sibling of voice/ inside case 1, so this resolves from this
+    # file alone -- no assumption about where the repo sits or what the
+    # sibling case folders are called.
+    sys.path.insert(0, str(Path(__file__).resolve().parent / "camera"))
     try:
         import vision_tools
     except Exception as exc:      # no OpenCV/YOLO, unreadable VISION_MODEL, ...
-        print(f"[ur-tools] vision unavailable, motion tools only: {exc}",
+        print(f"[ur-tools] camera unavailable, motion tools only: {exc}",
               file=sys.stderr)
         return
     mcp.mount(vision_tools.mcp)

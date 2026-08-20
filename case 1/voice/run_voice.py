@@ -1,7 +1,8 @@
 """Entry point: talk to the robot out loud.
 
-    python voice/run_voice.py                       # simulator + camera
+    python voice/run_voice.py                       # $UR_HOST, else simulator
     python voice/run_voice.py --robot 192.168.1.100 # the real UR5e + camera
+    export UR_HOST=192.168.1.100                    # ...or set it once
     python voice/run_voice.py --no-vision           # robot only, cannot see
     python voice/run_voice.py --text                # typed in (no microphone)
     python voice/run_voice.py --tts none            # typed in, printed out
@@ -9,12 +10,12 @@
     python voice/run_voice.py --list-devices        # which microphone is which
 
 WHICH ARM, AND WHETHER IT CAN SEE. Both follow from two flags, because the
-pairing is a safety matter rather than a preference: ``--robot IP`` means the
-real arm and therefore a ur5e safety envelope, and no ``--robot`` means the
-local simulator and its ur10e. Guarding a real UR5e with UR10e geometry would
+pairing is a safety matter rather than a preference: a real address (from
+``--robot IP`` or ``$UR_HOST``) means the real arm and therefore a ur5e safety
+envelope, and loopback or nothing means the local simulator and its ur10e. Guarding a real UR5e with UR10e geometry would
 approve targets 40 cm past its reach, so ``server.py`` refuses that pairing
 outright. ``--vision`` (the default) launches the merged camera+robot server
-through ``run_vision_root.sh`` under sudo -- the only way librealsense can
+through ``run_server.sh`` (under sudo on macOS, the only way librealsense can
 claim the D435 on macOS -- and yields 59 tools; ``--no-vision`` launches
 ``server.py`` directly for 43 tools and no perception at all.
 
@@ -43,38 +44,70 @@ from progress import HEARTBEAT_SECONDS, make_narrator
 from tts import DEFAULT_VOICE, make_speaker
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_REPO = os.path.abspath(os.path.join(_HERE, os.pardir, os.pardir))
+# case 1 itself: this file's parent. Everything below is resolved from it, so
+# the front-end never needs to know where the repo lives or what the sibling
+# folders are called.
+_CASE1 = os.path.abspath(os.path.join(_HERE, os.pardir))
 
 # The robot-only server: 43 tools, no root needed, and NO camera. Launched with
 # the interpreter running this script so it inherits the same virtualenv on
 # machines with no bare `python` on PATH.
-_ROBOT_ONLY_SERVER = os.path.abspath(
-    os.path.join(_HERE, os.pardir, "server.py"))
-# The merged server: those same 43 tools plus the 16 wrist-camera ones. It has
-# to go through the wrapper rather than being invoked directly, because
-# librealsense cannot claim the D435 on macOS without root -- and sudo strips
-# the environment, which is why UR_VISION and every UR_*/VISION_* setting live
-# INSIDE the wrapper and the robot arrives as its argument.
-_MERGED_SERVER = os.path.join(_REPO, "run_vision_root.sh")
+_ROBOT_ONLY_SERVER = os.path.join(_CASE1, "server.py")
+# The merged server: those same 43 tools plus the 16 wrist-camera ones. It goes
+# through the wrapper rather than being invoked directly because UR_VISION and
+# every UR_*/VISION_* setting live INSIDE that file -- sudo strips the
+# environment, so the robot has to arrive as an argument instead.
+_MERGED_SERVER = os.path.join(_CASE1, "run_server.sh")
+
+# Whether the camera needs root. This is a macOS problem, not a camera problem:
+# librealsense cannot claim the D435 there without it ("failed to set power
+# state"). On Linux the udev rules (99-realsense-libusb.rules, MODE 0666 +
+# plugdev) hand the device to the normal user, so routing through `sudo -n`
+# would add a passwordless-sudoers dependency that buys exactly nothing -- and
+# on a box without that rule it turns every run into "Connection closed".
+_CAMERA_NEEDS_ROOT = sys.platform == "darwin"
+
+
+# Default target for a cell that always drives the same arm, so the IP is
+# configuration rather than a flag typed on every run:
+#     export UR_HOST=192.168.1.100
+# --robot still wins over it, and it is deliberately NOT a literal in this file
+# -- an address baked into the source is exactly the laptop-specific coupling
+# the rest of this tree was cleaned of.
+_ENV_ROBOT = os.environ.get("UR_HOST", "").strip()
+
+
+def is_simulator(host: str) -> bool:
+    """Loopback (or nothing) means the local simulator, not a real arm."""
+    return not host or host == "localhost" or host.startswith("127.")
 
 
 def resolve_target(args) -> tuple[str, str]:
-    """(host, model) this run will drive, mirroring run_vision_root.sh's rule.
+    """(host, model) this run will drive, mirroring run_server.sh's rule.
 
-    No ``--robot`` means the local simulator and its UR10e; an IP means the
-    real arm, which is a UR5e in this cell. Deriving both from one flag is what
-    stops the host and the model from disagreeing: a real UR5e guarded by
-    UR10e geometry gets a safety layer that approves targets 40 cm beyond its
-    reach and 7.5 kg past its payload, which is why server.py now refuses that
-    combination outright.
+    A real address means the real arm, which is a UR5e in this cell; loopback
+    or nothing means the local simulator and its UR10e. Deriving both from one
+    value is what stops the host and the model from disagreeing: a real UR5e
+    guarded by UR10e geometry gets a safety layer that approves targets 40 cm
+    beyond its reach and 7.5 kg past its payload, which is why server.py
+    refuses that combination outright.
+
+    The host comes from --robot, else $UR_HOST, else the simulator. To force
+    the simulator while UR_HOST is exported, pass --robot 127.0.0.1.
     """
-    if args.robot:
-        return args.robot, (args.ur_model or "ur5e")
-    return "127.0.0.1", (args.ur_model or "ur10e")
+    host = args.robot or _ENV_ROBOT
+    if is_simulator(host):
+        return "127.0.0.1", (args.ur_model or "ur10e")
+    return host, (args.ur_model or "ur5e")
 
 
-def build_server_command(args) -> str:
-    """The MCP server command line, unless --server overrode it outright."""
+def build_server_command(args, host: str) -> str:
+    """The MCP server command line, unless --server overrode it outright.
+
+    Takes the RESOLVED host rather than reading ``args.robot``: with $UR_HOST
+    exported those two differ, and passing the flag would leave the server on
+    the simulator while the client believed it was driving the real arm.
+    """
     if args.server:
         return args.server
     if not args.vision:
@@ -82,24 +115,44 @@ def build_server_command(args) -> str:
                         (sys.executable, _ROBOT_ONLY_SERVER))
     # The wrapper takes the robot as its first argument and an optional model
     # override as its second; no arguments at all means the local simulator.
-    parts = ["/usr/bin/sudo", "-n", _MERGED_SERVER]
-    if args.robot or args.ur_model:
-        parts.append(args.robot or "")   # empty -> the simulator branch
+    parts = ["/usr/bin/sudo", "-n", _MERGED_SERVER] if _CAMERA_NEEDS_ROOT \
+        else [_MERGED_SERVER]
+    real = not is_simulator(host)
+    if real or args.ur_model:
+        parts.append(host if real else "")   # empty -> the simulator branch
         if args.ur_model:
             parts.append(args.ur_model)
     return " ".join(shlex.quote(p) for p in parts)
 
 
-def banner(host: str, model: str, vision: bool) -> str:
+# Present only when camera/'s tools actually mounted, so it answers "can this
+# session see?" without counting tools or parsing the server's log.
+_VISION_SENTINEL = "look"
+
+
+def banner(host: str, model: str, vision: bool,
+           tool_names: list[str] | None = None) -> str:
     """The header, naming the arm and the tools this session actually got.
 
     The old banner said "UR10e" unconditionally, which was exactly wrong on the
     day it mattered -- the defaults reached the real UR5e. Print what was
     resolved instead, so the operator sees the target before speaking to it.
+
+    ``vision`` is only what was ASKED for. ``_mount_vision`` is deliberately
+    non-fatal -- a missing OpenCV costs the perception tools, not the robot --
+    so a session can start with --vision and no eyes, and saying "camera +
+    robot" there is a lie the operator only discovers by asking the robot to
+    look at something. Report the catalogue that actually arrived.
     """
-    where = ("simulator" if host == "localhost" or host.startswith("127.")
-             else f"REAL ROBOT at {host}")
-    eyes = "camera + robot" if vision else "robot only -- NO camera"
+    where = "simulator" if is_simulator(host) else f"REAL ROBOT at {host}"
+    if tool_names is None:
+        eyes = "camera + robot" if vision else "robot only -- NO camera"
+    elif _VISION_SENTINEL in tool_names:
+        eyes = "camera + robot"
+    elif vision:
+        eyes = "robot only -- CAMERA FAILED to load (see the server log)"
+    else:
+        eyes = "robot only -- NO camera"
     return ("=========================================================\n"
             f" {model} -- voice assistant -- {where}\n"
             f" {eyes}\n"
@@ -118,7 +171,9 @@ def parse_args() -> argparse.Namespace:
                          "by default it is derived from --vision and --robot")
     ap.add_argument("--robot", default=None, metavar="IP",
                     help="drive the REAL robot at this address (e.g. "
-                         "192.168.1.100); omit it for the local simulator")
+                         "192.168.1.100); defaults to $UR_HOST, and falls "
+                         "back to the local simulator. Pass 127.0.0.1 to "
+                         "force the simulator when UR_HOST is exported")
     ap.add_argument("--ur-model", default=None,
                     choices=["ur10e", "ur5e", "ur5"],
                     help="which ARM the safety layer guards (not the LLM: "
@@ -127,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--vision", action=argparse.BooleanOptionalAction,
                     default=True,
                     help="launch the merged camera+robot server via "
-                         "run_vision_root.sh (needs the passwordless sudo "
+                         "run_server.sh (needs a passwordless sudo rule on "
                          "rule); --no-vision falls back to the 43-tool "
                          "robot-only server, which cannot see")
     ap.add_argument("--backend", choices=["claude", "openai"], default="claude",
@@ -227,7 +282,11 @@ async def main() -> int:
     # every UR_* variable. The merged server ignores all of this and takes its
     # configuration from the wrapper instead, because sudo strips it anyway.
     os.environ["UR_HOST"], os.environ["UR_MODEL"] = host, model
-    command, *server_args = shlex.split(build_server_command(args))
+    # Tell the wrapper which interpreter to use, so the server lands in the
+    # same environment as this client instead of guessing at a .venv that a
+    # given clone may not have. sudo strips it; the wrapper falls back then.
+    os.environ["VOICE_PYTHON"] = sys.executable
+    command, *server_args = shlex.split(build_server_command(args, host))
     log_path = None if args.server_log == "-" else args.server_log
     if not args.quiet:
         print(f"server: {command} {' '.join(server_args)}".rstrip())
@@ -247,13 +306,29 @@ async def main() -> int:
                   "Or run with --backend openai.", file=sys.stderr)
             close_voice(narrator, speaker)
             return 2
-        async with ClaudeCodeAgent(command, server_args, model=args.model,
-                                   verbose=not args.quiet,
-                                   narrator=narrator) as agent:
-            print(f"connected: {len(agent.tool_names)} tools available "
-                  f"(brain: Claude Code subscription)")
-            print(banner(host, model, args.vision))
-            await converse(args, agent, narrator, transcriber, mic)
+        # ``started`` separates a server that never came up from an error
+        # later in the conversation: only the former gets the diagnosis, the
+        # latter still deserves its real traceback.
+        started = False
+        try:
+            async with ClaudeCodeAgent(command, server_args, model=args.model,
+                                       verbose=not args.quiet,
+                                       narrator=narrator,
+                                       log_path=log_path) as agent:
+                started = True
+                print(f"connected: {len(agent.tool_names)} tools available "
+                      f"(brain: Claude Code subscription)")
+                if log_path:
+                    print(f"server log: {log_path}")
+                print(banner(host, model, args.vision,
+                             agent.tool_names))
+                await converse(args, agent, narrator, transcriber, mic)
+        except Exception:
+            if started:
+                raise
+            report_server_failure(log_path, command, server_args)
+            close_voice(narrator, speaker)
+            return 4
         close_voice(narrator, speaker)
         print("closed. The MCP server remains usable on its own.")
         return 0
@@ -270,20 +345,89 @@ async def main() -> int:
         close_voice(narrator, speaker)
         return 2
 
-    async with connect_tools(command, server_args, log_path=log_path) as tools:
-        schemas = await tools.openai_tools()
-        agent = VoiceAgent(tools, schemas, llm, verbose=not args.quiet,
-                           narrator=narrator)
-        print(f"connected: {len(schemas)} tools available "
-              f"(brain: {llm.model})")
-        if log_path:
-            print(f"server log: {log_path}")
-        print(banner(host, model, args.vision))
-        await converse(args, agent, narrator, transcriber, mic)
+    started = False
+    try:
+        async with connect_tools(command, server_args,
+                                 log_path=log_path) as tools:
+            schemas = await tools.openai_tools()
+            started = True
+            agent = VoiceAgent(tools, schemas, llm, verbose=not args.quiet,
+                               narrator=narrator)
+            print(f"connected: {len(schemas)} tools available "
+                  f"(brain: {llm.model})")
+            if log_path:
+                print(f"server log: {log_path}")
+            print(banner(host, model, args.vision,
+                         [s['function']['name'] for s in schemas]))
+            await converse(args, agent, narrator, transcriber, mic)
+    except Exception:
+        if started:
+            raise
+        report_server_failure(log_path, command, server_args)
+        close_voice(narrator, speaker)
+        return 4
 
     close_voice(narrator, speaker)
     print("closed. The MCP server remains usable on its own.")
     return 0
+
+
+# Matched against the server's stderr to turn its own words into the next
+# thing to type. Ordered: the first hit wins, so put the specific ones first.
+_STARTUP_HINTS = (
+    ("a password is required",
+     "The launcher went through `sudo -n`, but this machine has no\n"
+     "passwordless rule for it. On Linux the camera does not need root:\n"
+     "the udev rules give the D435 to your user, so this should not be a\n"
+     "sudo call at all. Re-run, or use --no-vision to skip the camera."),
+    ("Cannot reach the robot",
+     "The arm is not answering. For the simulator:\n"
+     "    cd \"simulation environment\" && docker compose up -d\n"
+     "then power on and release the brakes at http://localhost.\n"
+     "For the real arm, check --robot IP and the network."),
+    ("ModuleNotFoundError",
+     "The server started, but under an interpreter without its\n"
+     "dependencies. Check which python the launcher picked (printed as\n"
+     "'server:' above) against the one running this client."),
+    ("No such file or directory",
+     "A path inside the launcher does not exist on this machine."),
+)
+
+
+def report_server_failure(log_path: str | None, command: str,
+                          server_args: list[str]) -> None:
+    """Say why the MCP server would not start, instead of dumping a traceback.
+
+    Every startup failure arrives identically -- ``McpError: Connection
+    closed``, wrapped in an anyio ExceptionGroup that is sixty lines of
+    asyncio plumbing around one line of cause. The server's own stderr already
+    explains itself (``server.py`` even names the docker command that fixes
+    it), so print that instead and let the operator act on it.
+    """
+    print("\nThe MCP server did not start, so there are no tools to talk to.",
+          file=sys.stderr)
+    print(f"  launched: {command} {' '.join(server_args)}".rstrip(),
+          file=sys.stderr)
+
+    log = ""
+    if log_path and os.path.exists(log_path):
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            log = fh.read().strip()
+    if not log:
+        print("\nIts stderr was not captured. Re-run with --server-log - to "
+              "see it.", file=sys.stderr)
+        return
+
+    tail = log.splitlines()[-15:]
+    print("\n--- the server said " + "-" * 38, file=sys.stderr)
+    for line in tail:
+        print(f"  {line}", file=sys.stderr)
+    print("-" * 58, file=sys.stderr)
+
+    for needle, hint in _STARTUP_HINTS:
+        if needle in log:
+            print(f"\n{hint}", file=sys.stderr)
+            break
 
 
 def close_voice(narrator, speaker) -> None:

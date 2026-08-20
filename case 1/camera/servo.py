@@ -59,7 +59,9 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "case 1"))
+# The robot client lives one level up, in case 1 itself: camera/ is a
+# subpackage of it now, not a separate case reaching sideways.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from ur_client import URClient  # noqa: E402
 from camera import open_camera  # noqa: E402
 from detector import Detection, ObjectDetector  # noqa: E402
@@ -79,7 +81,7 @@ R_TOOL_CAM = np.eye(3)
 # of the wrist singularity. Adapt it to YOUR cell without touching code via
 # VISION_VIEW_Q_DEG: six comma-separated joint angles in degrees, e.g.
 # "-115,-90,90,-90,-90,0" spins the same L-shape to face a table at a
-# different bearing (set it in run_vision_root.sh -- sudo strips env vars).
+# different bearing (set it in run_server.sh -- sudo strips env vars).
 _VIEW_Q_DEFAULT_DEG = (0.0, -90.0, 90.0, -90.0, -90.0, 0.0)
 
 
@@ -781,7 +783,7 @@ def main() -> None:
     worker.start()
 
     selector = TargetSelector()
-    window = "case 4 -- YOLO26 visual servoing"
+    window = "case 1 -- YOLO26 visual servoing"
     cv2.namedWindow(window)
     latest_dets: list[Detection] = []
     cv2.setMouseCallback(

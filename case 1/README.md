@@ -193,7 +193,7 @@ safety check would assume an arm twice the size.
 
 1. **Preflight.** With the robot powered on and this machine on its network:
 
-       ../.venv/bin/python preflight_real_robot.py <robot-ip>
+       python3 preflight_real_robot.py <robot-ip>
 
    It checks the controller ports, PolyScope version, safety state, Remote
    Control mode (e-Series ignores external URScript without it: Settings >
@@ -201,7 +201,7 @@ safety check would assume an arm twice the size.
    RTDE state read. It never moves the robot.
 
 2. **Activate.** Fill the robot IP into `../mcp.real-robot.json` (and
-   `../run_vision_root.sh` for the case 4 camera servo), copy it over
+   `run_server.sh` for the camera servo), copy it over
    `../.mcp.json`, restart Claude Code. The template also caps speeds well
    below the simulator defaults (`UR_MAX_JOINT_SPEED` etc. -- env vars, no
    code changes) for the first sessions around people.
@@ -241,7 +241,7 @@ answers `STA ?` is running yet cannot reach the gripper -- that is a
 (activation, contact detection, reply framing, concurrent commands, the
 `?` reply) and needs no robot and no gripper:
 
-    ../.venv/bin/python test_robotiq_gripper.py
+    python3 test_robotiq_gripper.py
 
 ### Home pose
 
@@ -249,5 +249,5 @@ answers `STA ?` is running yet cannot reach the gripper -- that is a
 vertical, forearm horizontal, tool pointing straight down -- the wrist
 camera overlooks the table, and wrist2 at -90 keeps linear moves possible
 straight from home. `move_robot_to_position` with no arguments goes there;
-case 4's `go_view_pose` uses the same pose (override per cell via
-`VISION_VIEW_Q_DEG` in `../run_vision_root.sh`).
+the camera's `go_view_pose` uses the same pose (override per cell via
+`VISION_VIEW_Q_DEG` in `run_server.sh`).

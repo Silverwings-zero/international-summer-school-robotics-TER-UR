@@ -2,7 +2,7 @@
 
 Run this BEFORE editing any config, from the repo venv:
 
-    ../.venv/bin/python preflight_real_robot.py 192.168.1.10
+    python3 preflight_real_robot.py 192.168.1.10
 
 It verifies, in order: the three controller ports are reachable, what the
 dashboard says about the controller (PolyScope version, robot mode, safety

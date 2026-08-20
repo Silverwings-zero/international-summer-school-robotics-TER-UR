@@ -1,4 +1,4 @@
-# Case 4, Eye-in-Hand Visual Servoing
+# Wrist camera — eye-in-hand visual servoing
 
 A RealSense D435 on the UR wrist, YOLO26 finding the objects on the table,
 and a servo loop that steers the robot so the object you click stays in the
@@ -22,15 +22,19 @@ no manual camera-mount math?*
 | `requirements.txt` | ultralytics (YOLO26), OpenCV, RealSense bindings |
 | `hand_eye.json` | Appears after you press `c`: the measured hand-eye Jacobian |
 
-The robot side reuses `../case 1/ur_client.py` unchanged -- stdlib sockets,
-URScript `movel` for motion, RTDE for state. Nothing new to install for the
-robot; everything new is vision.
+The robot side reuses `../ur_client.py` unchanged -- stdlib sockets, URScript
+`movel` for motion, RTDE for state. Nothing new to install for the robot;
+everything new is vision.
+
+This folder is a subpackage of case 1, the sibling of `../voice/`: the same
+server owns motion and perception, and `../run_server.sh` starts both as one
+59-tool MCP. It was case 4 until the stack was consolidated; every path here
+is relative, so the tree moves without edits.
 
 ## Setup
 
 ```bash
-# from the repo root, in the repo venv
-.venv/bin/pip install -r "case 4/requirements.txt"
+python3 -m pip install -r "case 1/camera/requirements.txt"
 ```
 
 First run of `servo.py` downloads the YOLO26 nano weights (~6 MB).
@@ -42,7 +46,7 @@ raises `failed to set power state` (a documented macOS 12+ limitation, plus
 a harmless segfault on exit). So on a Mac, run the RealSense path as:
 
 ```bash
-sudo ../.venv/bin/python servo.py
+sudo python3 servo.py
 ```
 
 Plug the camera into a direct USB-C port (not a low-power hub). The webcam
@@ -60,11 +64,11 @@ vision stack.
 ## Run
 
 ```bash
-cd "case 4"
-../.venv/bin/python servo.py                    # RealSense + robot at $UR_HOST
-../.venv/bin/python servo.py --dry-run          # vision only, no robot
-../.venv/bin/python servo.py --camera webcam --host 192.168.1.10
-../.venv/bin/python servo.py --no-approach      # centre only, never approach
+cd "case 1/camera"
+python3 servo.py                    # RealSense + robot at $UR_HOST
+python3 servo.py --dry-run          # vision only, no robot
+python3 servo.py --camera webcam --host 192.168.1.10
+python3 servo.py --no-approach      # centre only, never approach
 ```
 
 In the window:
@@ -87,7 +91,7 @@ watch the robot re-centre.
 
 `vision_tools.py` exposes the same engine as tools an LLM can call, so "track
 the cup" and "descend on the phone" become tool calls. These no longer get an
-MCP entry of their own: `run_vision_root.sh` starts case 1's `server.py` with
+MCP entry of their own: `../run_server.sh` starts case 1's `server.py` with
 `UR_VISION=1`, which mounts this module's `mcp` into it, so the repo
 `.mcp.json` lists one `ur-tools` server carrying motion and vision together
 (names stay unprefixed -- `look`, not `vision_look`). Restart your MCP client

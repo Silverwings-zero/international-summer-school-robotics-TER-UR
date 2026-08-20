@@ -14,7 +14,7 @@ Two implementations behind one tiny interface (``read() -> Frame``):
     the approach axis, assuming ``assumed_depth_m`` for gain scaling.
 
 ``open_camera()`` picks whichever works and says which one you got. Nothing
-else in case 4 imports pyrealsense2 directly, so the rest of the code cannot
+else in camera/ imports pyrealsense2 directly, so the rest of the code cannot
 break on a machine where it is missing.
 """
 from __future__ import annotations
@@ -135,7 +135,7 @@ class RealSenseCamera:
         except ImportError as exc:
             raise RuntimeError(
                 "pyrealsense2 is not installed in this environment "
-                "(see case 4/README.md for the macOS install path)."
+                "(see camera/README.md for the macOS install path)."
             ) from exc
         self._rs = rs
         # On macOS every librealsense process exit -- even after a clean

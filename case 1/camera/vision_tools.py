@@ -1,6 +1,6 @@
 """MCP server: the wrist camera as LLM-callable tools.
 
-Turns case 4's visual servoing into language: "track the cup" becomes
+Turns the wrist camera's visual servoing into language: "track the cup" becomes
 ``track_object("cup")``, "descend on the phone" becomes
 ``descend_on("phone")``. The tools wrap the same engine ``servo.py`` drives
 from its GUI -- one perception thread feeding observations, one worker thread
@@ -24,8 +24,8 @@ Two perception modes, chosen by the ``VISION_MODE`` environment variable:
 Register next to ur-tools in ``.mcp.json``::
 
     "vision-tools": {
-      "command": ".../.venv/bin/python",
-      "args": [".../case 4/vision_tools.py"],
+      "command": "python3",
+      "args": [".../case 1/camera/vision_tools.py"],
       "env": {"VISION_MODE": "sim"}
     }
 """
@@ -45,8 +45,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+# This directory (camera.py, detector.py, servo.py), then case 1 above it for
+# ur_client. Both are relative to this file, so the tree can be cloned or moved
+# anywhere without either import breaking.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "case 1"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from fastmcp import FastMCP  # noqa: E402
 
@@ -1066,7 +1069,7 @@ def go_view_pose(wait_s: float = 45.0) -> dict:
     faces, and the camera height differs between arms (a UR5e's shorter
     links sit lower than the UR10e simulator's). Adapt it per cell by
     exporting VISION_VIEW_Q_DEG (six comma-separated joint angles in
-    degrees) in run_vision_root.sh; the code default is
+    degrees) in run_server.sh; the code default is
     "0,-90,90,-90,-90,0".
 
     Raises:
@@ -1172,7 +1175,7 @@ if __name__ == "__main__":
         sys.exit(0)
     if "--cam-test" in sys.argv:
         # Probe the real camera without the MCP stack or the robot, e.g.
-        # `sudo -n ./run_vision_root.sh --cam-test`. Prints arrive before
+        # `"case 1/run_server.sh" --cam-test`. Prints arrive before
         # exit so they survive librealsense's harmless macOS exit segfault.
         from camera import open_camera
         cam = open_camera(os.environ.get("VISION_CAMERA", "auto"))

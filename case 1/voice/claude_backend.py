@@ -51,16 +51,21 @@ class ClaudeCodeAgent:
         verbose: Print each tool call as it happens.
         narrator: Speaks progress while the turn runs. Defaults to silence,
             which is what a caller with no speaker wants.
+        log_path: File for the server's stderr. This used to be hardcoded to
+            None here, so ``--server-log`` silently did nothing on the default
+            backend -- and a server that died on startup left no log at all to
+            explain why.
     """
 
     def __init__(self, server_command: str, server_args: list[str],
                  model: str | None = None, verbose: bool = True,
-                 narrator=None) -> None:
+                 narrator=None, log_path: str | None = None) -> None:
         self._command = server_command
         self._args = list(server_args)
         self._model = model
         self.verbose = verbose
         self.narrator = narrator or NullNarrator()
+        self._log_path = log_path
         self._client = None
         self._stop_tools = None
         self._stop_cm = None
@@ -75,7 +80,7 @@ class ClaudeCodeAgent:
         # It is a SECOND server.py process, separate from the one the SDK
         # launches. That is deliberate -- see emergency_stop().
         self._stop_cm = connect_tools(self._command, self._args,
-                                      log_path=None)
+                                      log_path=self._log_path)
         self._stop_tools = await self._stop_cm.__aenter__()
         schemas = await self._stop_tools.openai_tools()
         self.tool_names = [s["function"]["name"] for s in schemas]
