@@ -14,6 +14,13 @@ export VISION_MODE=real          # no simulated camera
 export VISION_CAMERA=realsense   # fail loudly instead of falling back to webcam
 export VISION_MODEL="$REPO/case 4/yolo26n.pt"   # absolute: cwd/HOME differ under sudo
 
+# Cell-specific HOME/observation pose for go_view_pose, six joint angles in
+# degrees. The code default is the kitchen home [0,-90,90,-90,-90,0] (upper
+# arm vertical, forearm horizontal, tool straight down); once the base
+# bearing that faces YOUR table is taught, set it here (sudo strips env, so
+# it must live in this wrapper, not .mcp.json):
+# export VISION_VIEW_Q_DEG="0,-90,90,-90,-90,0"
+
 # Robot the vision servo drives. sudo strips env vars, so the target comes
 # as the first ARGUMENT (see mcp.real-robot.json); with no argument the
 # wrapper stays on the local simulator, so the sim .mcp.json and the real

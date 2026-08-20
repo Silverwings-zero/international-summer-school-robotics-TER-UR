@@ -72,10 +72,29 @@ from detector import Detection, ObjectDetector  # noqa: E402
 # measure the true mapping -- calibration overrides this entirely.
 R_TOOL_CAM = np.eye(3)
 
-# Observation pose for the 'v' key: joints (rad) with the tool facing the
-# table and wrist2 well away from 0. Default is the tested BENT pose from
-# case 1's record_signals.py; EDIT to a pose that overlooks YOUR table.
-VIEW_Q = [0.3490659, -1.2217305, 0.7853982, -1.1344640, -0.5235988, 0.0]
+# Observation pose for the 'v' key and go_view_pose: joints (rad). Default is
+# the kitchen-cell HOME (same pose as case 1's HOME_Q_RAD): upper arm
+# vertical, forearm horizontal, tool pointing straight down, so the wrist
+# camera overlooks the table from ~0.5 m with wrist2 at -90 deg -- well clear
+# of the wrist singularity. Adapt it to YOUR cell without touching code via
+# VISION_VIEW_Q_DEG: six comma-separated joint angles in degrees, e.g.
+# "-115,-90,90,-90,-90,0" spins the same L-shape to face a table at a
+# different bearing (set it in run_vision_root.sh -- sudo strips env vars).
+_VIEW_Q_DEFAULT_DEG = (0.0, -90.0, 90.0, -90.0, -90.0, 0.0)
+
+
+def _view_q() -> list[float]:
+    raw = os.environ.get("VISION_VIEW_Q_DEG", "").strip()
+    if not raw:
+        return [math.radians(a) for a in _VIEW_Q_DEFAULT_DEG]
+    parts = [float(p) for p in raw.split(",")]
+    if len(parts) != 6:
+        raise ValueError(
+            f"VISION_VIEW_Q_DEG needs 6 comma-separated degrees, got {raw!r}")
+    return [math.radians(a) for a in parts]
+
+
+VIEW_Q = _view_q()
 
 HAND_EYE_PATH = Path(__file__).with_name("hand_eye.json")
 

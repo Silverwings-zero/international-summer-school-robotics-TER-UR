@@ -23,14 +23,14 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
-from ur_client import URClient  # noqa: E402
+from ur_client import HOME_Q_RAD, URClient  # noqa: E402
 
 HOST = "127.0.0.1"
 RTDE_PORT = 30004
 FIELDS = ("timestamp,target_q,actual_q,target_qd,actual_qd,"
           "target_current,actual_current,target_moment,actual_TCP_force")
 
-HOME = [0.0, -1.5707963, 0.0, -1.5707963, 0.0, 0.0]
+HOME = HOME_Q_RAD
 BENT = [0.3490659, -1.2217305, 0.7853982, -1.1344640, -0.5235988, 0.0]  # [20,-70,45,-65,-30,0] deg
 
 

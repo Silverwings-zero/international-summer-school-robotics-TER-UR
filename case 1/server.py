@@ -42,6 +42,11 @@ from pathlib import Path
 from fastmcp import FastMCP
 
 from motion_patterns import PatternRunner, max_speed_for_radius
+from robotiq_gripper import (
+    HARDWARE_FAULTS,
+    GripperError,
+    RobotiqGripper,
+)
 from ur_client import (
     HOME_Q_RAD,
     JOINT_LIMIT,
@@ -77,7 +82,52 @@ SAFETY_STATUS_NAMES = {
 
 # The digital output a gripper listens on (tool IO convention; the simulator
 # has no physical gripper, so this drives the command line one would read).
+# On the real cell a Robotiq is driven through its URCap instead -- see
+# _robotiq() below; the pin stays as the simulator fallback.
 GRIPPER_PIN = 0
+
+# The Robotiq driver, connected lazily. None means "not found last time we
+# looked" -- and we look again on every gripper call, so plugging the gripper
+# in (or installing the URCap) later just works without a server restart.
+_GRIPPER_LOCK = threading.Lock()
+_ROBOTIQ: RobotiqGripper | None = None
+
+
+def _robotiq() -> RobotiqGripper | None:
+    """Return a live Robotiq driver, or None when no URCap answers."""
+    global _ROBOTIQ
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is not None:
+            return _ROBOTIQ
+    # Probe OUTSIDE the lock: when the controller is unreachable this blocks
+    # for the connect timeout, and holding the lock would serialize every
+    # gripper call (and get_robot_state) behind it.
+    candidate = RobotiqGripper(host=robot.host)
+    try:
+        candidate.connect()
+    except OSError:
+        return None
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is not None:
+            # Another thread won the race; keep its connection, drop ours.
+            winner = _ROBOTIQ
+            candidate.close()
+            return winner
+        _ROBOTIQ = candidate
+        return _ROBOTIQ
+
+
+def _drop_robotiq(failed: RobotiqGripper) -> None:
+    """Forget a dead connection so the next call re-probes from scratch.
+
+    Identity-aware: a late error from an old connection must not tear down
+    the healthy one that replaced it.
+    """
+    global _ROBOTIQ
+    with _GRIPPER_LOCK:
+        if _ROBOTIQ is failed:
+            _ROBOTIQ = None
+    failed.close()
 
 
 # =========================================================================== #
@@ -591,8 +641,9 @@ def move_robot_to_position(
 
     Give six target joint angles in degrees, ordered base, shoulder, elbow,
     wrist1, wrist2, wrist3. Omit them to send the robot to its HOME position
-    ([0, -90, 0, -90, 0, 0] degrees) -- "move the robot home" is a call with no
-    arguments.
+    ([0, -90, 90, -90, -90, 0] degrees: upper arm vertical, forearm
+    horizontal, tool pointing straight down, so the wrist camera overlooks
+    the table) -- "move the robot home" is a call with no arguments.
 
     The move blocks until the robot arrives (the wait budget adapts to the
     distance and speed), then returns the new robot state (so you can observe
@@ -674,10 +725,31 @@ def get_robot_state() -> dict:
         ``ready_to_move``: True only when the mode is RUNNING and the safety
             status is NORMAL, so motion commands will be accepted.
         ``moving``: True while any joint is still in motion.
-        ``gripper_closed``: the commanded gripper state (digital output).
+        ``gripper_closed``: the COMMANDED gripper state (a Robotiq holding a
+            slim object sits mid-travel but still reads closed).
+        ``gripper_holding``: True when the Robotiq's fingers stopped on an
+            object, False when they reached the commanded position freely,
+            None when no Robotiq is connected (no contact sensing).
     """
     # 4. Execute (a read), then report in human units.
     state = robot.get_state()
+    # Both backends report the COMMANDED state, so the meaning of
+    # gripper_closed does not change with the hardware: on a Robotiq that is
+    # the requested position (PRE), not the actual one -- fingers holding a
+    # 30 mm cup sit mid-travel and must still read as "closed". Whether
+    # something is actually held is a separate flag. Only an
+    # already-connected Robotiq is consulted, so the state-read path never
+    # pays for a probe.
+    gripper_closed = bool(state.digital_out >> GRIPPER_PIN & 1)
+    gripper_holding: bool | None = None
+    robotiq = _ROBOTIQ
+    if robotiq is not None:
+        try:
+            gripper_closed = robotiq.get("PRE") > 128
+            gripper_holding = robotiq.get("OBJ") in (1, 2)
+        except (OSError, GripperError):
+            _drop_robotiq(robotiq)
+            gripper_holding = None
     return {
         "joints_deg": {n: round(math.degrees(q), 2)
                        for n, q in zip(JOINT_NAMES, state.q_rad)},
@@ -691,7 +763,8 @@ def get_robot_state() -> dict:
         "ready_to_move": (state.robot_mode == ROBOT_MODE_RUNNING
                           and state.safety_status == 1),
         "moving": state.is_moving,
-        "gripper_closed": bool(state.digital_out >> GRIPPER_PIN & 1),
+        "gripper_closed": gripper_closed,
+        "gripper_holding": gripper_holding,
     }
 
 
@@ -1007,37 +1080,223 @@ def _freedrive_worker():
         _FREEDRIVE_ACTIVE = False
 
 # =========================================================================== #
-# DIAMOND TOOL  --  gripper via digital IO. The simulator has no physical
-# gripper; this drives the digital output a real one (tool IO) would follow,
-# and reads the commanded state back over RTDE so the report is ground truth.
+# DIAMOND TOOLS  --  gripper. On the real cell a Robotiq 2F is driven through
+# its URCap command server (port 63352 on the controller) with real position,
+# speed, force, and object-detection feedback. The simulator has no gripper,
+# so there the tools fall back to the digital-output convention and say so.
 # =========================================================================== #
+@mcp.tool
+def check_gripper() -> dict:
+    """Detect the gripper and report its state. Never moves anything.
+
+    Call this after (re)connecting hardware, and before the first grasp of a
+    session. It probes the Robotiq URCap port on the controller: when a
+    Robotiq answers, the report includes activation, position, and fault
+    state, plus the next step to take (``activate_gripper`` if it is not
+    yet activated). When nothing answers, gripper commands fall back to
+    driving digital output pin 0 -- the simulator convention, with no
+    force or object feedback.
+
+    Returns:
+        A dict with ``connected`` (a Robotiq answered), ``backend``
+        ("robotiq" or "digital-out-fallback"), and, for a live Robotiq,
+        its full status and a ``next_step`` hint.
+    """
+    gripper = _robotiq()
+    if gripper is None:
+        report = {
+            "connected": False,
+            "backend": "digital-out-fallback",
+            "detail": (
+                f"No Robotiq URCap answering on {robot.host}:63352. On the "
+                "simulator this is normal. On the real robot the URCap is "
+                "the only network path to the gripper: install/enable the "
+                "Robotiq Grippers URCap on the pendant (Settings > System > "
+                "URCaps), then call this again."),
+        }
+        # An unpowered tool connector is the other common reason a mounted
+        # gripper is silent, and it is worth reporting before the operator
+        # goes hunting through URCap menus.
+        try:
+            power = robot.get_tool_power()
+            report["tool_power"] = {
+                "voltage_v": power.voltage_v,
+                "current_a": round(power.current_a, 3),
+                "interface": power.tool_mode_name,
+                "powered": power.powered,
+            }
+            if not power.powered:
+                report["next_step"] = (
+                    "The tool connector is supplying 0 V, so a mounted "
+                    "gripper has no power at all. Set Tool Output Voltage to "
+                    "24 V (pendant: Installation > General > Tool I/O, or "
+                    "the set_tool_voltage tool) before debugging further.")
+        except Exception:  # noqa: BLE001 - diagnostics must never fail the tool
+            pass
+        return report
+    try:
+        status = gripper.status()
+    except (OSError, GripperError) as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(
+            f"A gripper port answered but the status read failed: {exc}. "
+            "Retry check_gripper; if it keeps failing, power-cycle the "
+            "gripper.") from exc
+    report = {"connected": True, "backend": "robotiq", **status.as_dict()}
+    # A hardware fault outranks "not activated": an unplugged gripper is
+    # BOTH, and telling the operator to activate it just wastes their time.
+    if status.fault in HARDWARE_FAULTS:
+        report["next_step"] = (
+            f"Gripper reports {status.fault_name}: the URCap is running but "
+            "the gripper itself is not answering. Check the tool cable and "
+            "that the tool connector supplies 24 V, then call this again.")
+    elif status.fault:
+        report["next_step"] = (
+            f"Gripper reports fault {status.fault_name}; power-cycle the "
+            "gripper or re-run activate_gripper.")
+    elif not status.activated:
+        report["next_step"] = (
+            "Gripper is not activated. Clear the space in front of the "
+            "fingers (they sweep full travel to self-calibrate) and call "
+            "activate_gripper.")
+    return report
+
+
+@mcp.tool
+def activate_gripper() -> dict:
+    """Run the Robotiq activation cycle and wait until it is ready.
+
+    A Robotiq must be activated once after each power-up before it accepts
+    motion commands. Activation sweeps the fingers through their FULL travel
+    to self-calibrate -- make sure nothing (and nobody) is between them.
+    Already-activated grippers return immediately, so this is always safe
+    to call before a grasping task.
+
+    Returns:
+        The gripper status dict after activation (``activated`` true).
+
+    Raises:
+        ValueError: No Robotiq is connected (nothing to activate).
+        RuntimeError: Activation failed or timed out.
+    """
+    gripper = _robotiq()
+    if gripper is None:
+        raise ValueError(
+            f"No Robotiq URCap answering on {robot.host}:63352 -- nothing "
+            "to activate. Run check_gripper for diagnostics.")
+    try:
+        status = gripper.activate()
+    except GripperError as exc:
+        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
+    except OSError as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(f"Gripper activation failed: {exc}") from exc
+    return {"backend": "robotiq", **status.as_dict()}
+
+
+@mcp.tool
+def set_gripper_position(position_pct: float, speed_pct: float = 50.0,
+                         force_pct: float = 25.0) -> dict:
+    """Move the gripper fingers to a width, with speed and force control.
+
+    Use this instead of ``set_gripper`` when the opening matters: pre-opening
+    just wider than an object, or closing gently around something soft.
+    Blocks until the fingers arrive or stop on contact, so the returned
+    ``object_detected`` is trustworthy. Defaults are gentle on purpose --
+    this cell works alongside people.
+
+    Args:
+        position_pct: Target closure, 0 = fully open .. 100 = fully closed.
+        speed_pct: Finger speed, 0 (slowest) .. 100 (fastest).
+        force_pct: Grip force limit, 0 (lightest) .. 100 (strongest).
+
+    Returns:
+        The gripper status dict: ``position_pct`` and ``opening_mm``
+        actually reached, ``object_detected`` (fingers stopped early on
+        something), and the ``model`` the mm figure assumes.
+
+    Raises:
+        ValueError: Argument out of range, no Robotiq connected, or the
+            gripper is not activated yet.
+        RuntimeError: The gripper stopped answering mid-move.
+    """
+    # 1. Validate ranges before touching hardware.
+    for name, value in (("position_pct", position_pct),
+                        ("speed_pct", speed_pct), ("force_pct", force_pct)):
+        if not 0.0 <= value <= 100.0:
+            raise ValueError(f"{name} must be within 0..100, got {value}.")
+    gripper = _robotiq()
+    if gripper is None:
+        raise ValueError(
+            "Position control needs a Robotiq (none is connected). For the "
+            "simulator's on/off gripper use set_gripper instead.")
+    # 2. Convert percentages to the gripper's 0..255 registers.
+    try:
+        status = gripper.move(
+            position=round(position_pct / 100.0 * 255),
+            speed=round(speed_pct / 100.0 * 255),
+            force=round(force_pct / 100.0 * 255),
+        )
+    except GripperError as exc:
+        raise ValueError(str(exc)) from exc
+    except OSError as exc:
+        _drop_robotiq(gripper)
+        raise RuntimeError(
+            f"Lost the gripper connection mid-move: {exc}") from exc
+    return {"backend": "robotiq", **status.as_dict()}
+
+
 @mcp.tool
 def set_gripper(closed: bool) -> dict:
     """Open or close the gripper.
 
     Use ``closed=true`` to grip (before lifting an object) and
-    ``closed=false`` to release. The command drives the robot's gripper
-    digital output and confirms it by reading the IO state back from the
-    controller. Check ``get_robot_state``'s ``gripper_closed`` afterwards if
-    you need to re-verify during a longer task.
+    ``closed=false`` to release. With a Robotiq connected this closes at a
+    gentle default force and reports ``object_detected``: true means the
+    fingers stopped on something, so the grasp holds. False after a close
+    means they ran to the fully-closed stop -- usually a MISS, though a very
+    thin or soft item can also let them reach it, so confirm with
+    ``opening_mm`` (0 mm means nothing is between the fingers).
+    Without a Robotiq (the simulator) it falls back to driving the gripper
+    digital output and confirming it over RTDE. For finer control of width,
+    speed, or force use ``set_gripper_position``.
 
     Args:
         closed: True to close the gripper, False to open it.
 
     Returns:
-        A dict with ``gripper`` ("closed" or "open"), the gripper ``pin``
-        number, and ``pin_state`` (the confirmed digital-output level).
+        A dict with ``gripper`` ("closed" or "open") and ``backend``
+        ("robotiq": full status incl. ``object_detected``;
+        "digital-out-fallback": the ``pin`` and confirmed ``pin_state``).
 
     Raises:
-        RuntimeError: The robot is not powered on.
+        ValueError: The Robotiq is present but not activated yet.
+        RuntimeError: The robot is not powered on (fallback path), or the
+            gripper stopped answering.
         TimeoutError: The controller did not confirm the output change.
     """
-    # 1.-3. A boolean needs no validation, conversion, or limit checks.
-    # 4. Execute and report the state read back from the controller.
+    gripper = _robotiq()
+    if gripper is not None:
+        try:
+            status = gripper.move(position=255 if closed else 0)
+        except GripperError as exc:
+            raise ValueError(str(exc)) from exc
+        except OSError as exc:
+            _drop_robotiq(gripper)
+            raise RuntimeError(
+                f"Lost the gripper connection mid-move: {exc}") from exc
+        return {
+            "gripper": "closed" if closed else "open",
+            "backend": "robotiq",
+            **status.as_dict(),
+        }
+    # Fallback: the simulator's digital-output convention, confirmed by
+    # reading the IO state back from the controller.
     state = robot.set_digital_out(GRIPPER_PIN, closed)
     confirmed = bool(state.digital_out >> GRIPPER_PIN & 1)
     return {
         "gripper": "closed" if confirmed else "open",
+        "backend": "digital-out-fallback",
         "pin": GRIPPER_PIN,
         "pin_state": confirmed,
     }

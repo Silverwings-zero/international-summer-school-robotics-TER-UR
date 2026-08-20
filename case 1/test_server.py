@@ -34,7 +34,12 @@ from server import mcp, robot
 # logging their tracebacks so the test output stays clean.
 logging.disable(logging.CRITICAL)
 
-HOME_DEG = [0, -90, 0, -90, 0, 0]
+# The kitchen home: upper arm vertical, forearm horizontal, tool straight
+# down, wrist2 clear of the singularity (must match ur_client.HOME_Q_RAD).
+HOME_DEG = [0, -90, 90, -90, -90, 0]
+# The old stretched home -- kept around because it is the canonical SINGULAR
+# configuration (straight elbow AND aligned wrist) the safety tests need.
+STRETCHED_DEG = [0, -90, 0, -90, 0, 0]
 
 REQUIRED_TOOLS = {
     "move_robot_to_position", "get_robot_state", "move_joints_relative",
@@ -43,6 +48,7 @@ REQUIRED_TOOLS = {
     "set_payload_mass", "set_gravity", "get_digital_in", "set_digital_out",
     "store_waypoint_pose_on_ur", "store_joint_configuration_on_ur",
     "move_to_stored_tcp_waypoint", "move_to_stored_joint_configuration",
+    "check_gripper", "activate_gripper", "set_gripper_position",
     "example",
 }
 
@@ -264,9 +270,12 @@ async def main() -> None:
         await expect_rejection(
             client, "move_joints_relative", {"delta_deg": [10, 0]},
             "bad delta count", must_contain="Expected 6 joint deltas")
-        # From home the arm is singular (stretched elbow, aligned wrist):
-        # a linear move must be refused, not protective-stopped.
-        await client.call_tool("move_robot_to_position", {})
+        # From the stretched pose the arm is singular (straight elbow,
+        # aligned wrist): a linear move must be refused, not
+        # protective-stopped. (This used to be home; the kitchen home is
+        # deliberately non-singular, so stretch explicitly here.)
+        await client.call_tool("move_robot_to_position",
+                               {"joint_angles_deg": STRETCHED_DEG})
         await expect_rejection(
             client, "move_linear", {"position_m": [0.0, -0.29, 1.30]},
             "linear-from-singularity", must_contain="singularity")
@@ -286,12 +295,28 @@ async def main() -> None:
         stop_freedrive = await client.call_tool("stop_freedrive_mode", {})
         assert stop_freedrive.data["status"] == "stopped"
 
-        # --- Diamond: gripper via digital IO, confirmed over RTDE --------- #
+        # --- Diamond: gripper. The simulator has no Robotiq URCap, so
+        # detection must report the fallback and set_gripper must drive the
+        # digital output, confirmed over RTDE. ----------------------------- #
+        detect = await client.call_tool("check_gripper", {})
+        assert detect.data["connected"] is False
+        assert detect.data["backend"] == "digital-out-fallback"
+        print("check_gripper:", detect.data["backend"])
         grip = await client.call_tool("set_gripper", {"closed": True})
         assert grip.data["gripper"] == "closed" and grip.data["pin_state"] is True
         release = await client.call_tool("set_gripper", {"closed": False})
         assert release.data["gripper"] == "open" and release.data["pin_state"] is False
         print("gripper: close + open confirmed on DO pin", grip.data["pin"])
+        # Robotiq-only tools must refuse cleanly, not crash, without one.
+        await expect_rejection(
+            client, "activate_gripper", {},
+            "activate-without-robotiq", must_contain="No Robotiq")
+        await expect_rejection(
+            client, "set_gripper_position", {"position_pct": 50.0},
+            "position-without-robotiq", must_contain="Robotiq")
+        await expect_rejection(
+            client, "set_gripper_position", {"position_pct": 150.0},
+            "position-out-of-range", must_contain="0..100")
 
         # --- The review-found race: an out-and-back path that ends where it
         # starts must actually RUN, not return 'reached' instantly. -------- #
