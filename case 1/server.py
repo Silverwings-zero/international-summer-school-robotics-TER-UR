@@ -1079,15 +1079,45 @@ def get_trajectory_job_status(
 
 _FREEDRIVE_ACTIVE = False
 
-def _freedrive_worker():
+
+def _freedrive_script(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> str:
+    script = "  freedrive_mode"
+    if free_axes is not None or feature is not None:
+        args = []
+        if free_axes is not None:
+            if len(free_axes) != 6:
+                raise ValueError(
+                    f"free_axes must have 6 entries, got {len(free_axes)}.")
+            args.append(
+                "freeAxes=[" + ",".join(str(int(v)) for v in free_axes) + "]"
+            )
+        if feature is not None:
+            if len(feature) not in (5, 6):
+                raise ValueError(
+                    "feature must have 5 or 6 values, got "
+                    f"{len(feature)}.")
+            args.append(
+                "feature=p[" + ",".join(f"{float(v):.6f}" for v in feature) + "]"
+            )
+        script += "(" + ", ".join(args) + ")"
+    return script + "\n"
+
+
+
+def _freedrive_worker(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+):
     global _FREEDRIVE_ACTIVE
 
     try:
+        script = _freedrive_script(free_axes=free_axes, feature=feature)
         # This must stay alive long enough for freedrive to remain active.
         # If your API supports async execution, prefer that.
-        robot.run_script("  freedrive_mode()\n"
-                         f"  sleep({float(300):.3f})\n"
-                         , timeout_s=300.0)
+        robot.run_script(script + f"  sleep({float(300):.3f})\n", timeout_s=300.0)
     finally:
         _FREEDRIVE_ACTIVE = False
 
@@ -1353,23 +1383,43 @@ def set_analog_out(n: int, f: float) -> dict:
 
 
 @mcp.tool
-def freedrive_mode(duration_s: float = 10.0) -> dict:
-    """Enable freedrive for manual guiding, keep it for a specific amount of time then automatically exit.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
-        
-     Args:   
-        duration_s: Freedrive hold time in seconds (0.5 to 120).
-        
+def timed_freedrive_mode(
+    duration_s: float = 10.0,
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> dict:
+    """Temporarily enable manual hand-guiding in freedrive mode.
+
+    Use this when the operator wants to move the robot by hand for a short
+    teaching or repositioning step. The robot remains compliant for the given
+    duration, then exits freedrive automatically.
+
+    Args:
+        duration_s: Length of the freedrive window in seconds. Typical values are
+            5-30 s; must be in [0.5, 120].
+        free_axes: Optional six-element list of 0/1 values that limits which
+            Cartesian/rotational axes are free. Example: [1, 0, 0, 0, 0, 0]
+            means only the X axis is free in the selected feature frame.
+        feature: Optional pose-like reference frame used together with
+            free_axes. Example: [0.1, 0.0, 0.0, 0.0, 0.785] creates a feature
+            frame offset from the current tool frame for the guided motion.
+
+    Returns:
+        A dict with ``status`` set to ``completed`` and the robot state at the
+        end of the timed freedrive period. The robot should be in normal mode
+        again after the timeout, because the script ends freedrive_mode() before
+        returning.
+
+    Example URScript equivalent:
+        freedrive_mode(freeAxes=[1,0,0,0,0,0], feature=p[0.1,0,0,0,0.785])
     """
     if not 0.5 <= duration_s <= 120.0:
         raise ValueError(
             f"duration_s must be in [0.5, 120.0], got {duration_s}."
         )
-    body = (
-        "  freedrive_mode()\n"
-        f"  sleep({float(duration_s):.3f})\n"
-        "  end_freedrive_mode()\n"
-    )
+    body = _freedrive_script(free_axes=free_axes, feature=feature)
+    body += f"  sleep({float(duration_s):.3f})\n"
+    body += "  end_freedrive_mode()\n"
     state = robot.run_script(body, timeout_s=max(10.0, float(duration_s) + 5.0))
     return {
         "status": "completed",
@@ -1380,18 +1430,43 @@ def freedrive_mode(duration_s: float = 10.0) -> dict:
     }
 
 @mcp.tool
-def start_freedrive_mode() -> dict:
+def start_freedrive_mode(
+    free_axes: list[int] | None = None,
+    feature: list[float] | None = None,
+) -> dict:
     global _FREEDRIVE_ACTIVE
-    """Start freedrive for manual guiding. It will not stop until an ending command is sent.
-    Remind the user to call stop_freedrive_mode() when finished. 
-    Do not let the user call different commands remind them to stopp freedrive mode first.
-    With Freedrive you can quickly reajust the robot to a new position, go to a new point if you want to teach it.
-    Freedrive means the robot can be moved by hand without motors resisting, for example to teach a pose or to move the arm out of the way. 
+    """Start manual hand-guiding in freedrive mode until stop_freedrive_mode() is called.
+
+    Use this when the operator needs to reposition the robot by hand without
+    resisting motion, such as teaching a target pose, adjusting alignment, or
+    moving the tool clear of an obstacle. Freedrive is persistent until explicitly
+    ended; other motion commands should not be started while it is active.
+
+    Args:
+        free_axes: Optional six-element list of 0/1 values. A 1 means that axis is
+            free to move in the selected feature frame; a 0 locks it. Example:
+            [1, 0, 0, 0, 0, 0] allows motion only along the X axis.
+        feature: Optional pose-like frame definition used together with free_axes.
+            It defines the coordinate system in which the free axes are applied.
+            Example: [0.1, 0.0, 0.0, 0.0, 0.785] sets a local feature frame.
+
+    Returns:
+        A dict with ``status`` set to ``started`` when freedrive begins, or
+        ``already_started`` if it is already active. The expected robot behavior
+        is that the arm becomes compliant and can be moved by hand until
+        stop_freedrive_mode() is called.
+
+    Example URScript equivalent:
+        freedrive_mode(freeAxes=[1,0,0,0,0,0], feature=p[0.1,0,0,0,0.785])
     """
     if _FREEDRIVE_ACTIVE:
         return {"status": "already_started", "mode": "freedrive"}
     else:
-        thread = threading.Thread(target=_freedrive_worker, daemon=True)
+        thread = threading.Thread(
+            target=_freedrive_worker,
+            args=(free_axes, feature),
+            daemon=True,
+        )
         thread.start()
         _FREEDRIVE_ACTIVE = True
     return {"status": "started", "mode": "freedrive"}
